@@ -17,6 +17,58 @@ const getYoutubeId = (url: string) => {
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+// ─── Speaker Profile Schema ───────────────────────────────────────────────────
+// Rich structured profiles so AI can match speakers across many transcripts
+interface SpeakerProfile {
+  fullName: string;
+  aliases: string[];           // nicknames, partial names the AI might see
+  role: string;                // journalist, defendant, lawyer, witness, etc.
+  topics: string[];            // recurring subjects they discuss
+  speechPatterns: string;      // distinctive phrases, cadence, vocabulary
+  firstSeen: string;           // ISO date of first transcript
+  lastSeen: string;            // ISO date of most recent transcript
+  appearances: number;         // how many transcripts they've appeared in
+  confidence: 'learning' | 'confirmed' | 'verified';
+  notes: string;               // any extra context
+}
+
+// Convert legacy string profiles to new schema on load
+function migrateLegacyProfiles(raw: Record<string, any>): Record<string, SpeakerProfile> {
+  const out: Record<string, SpeakerProfile> = {};
+  for (const [name, val] of Object.entries(raw)) {
+    if (typeof val === 'string') {
+      out[name] = {
+        fullName: name,
+        aliases: [],
+        role: '',
+        topics: [],
+        speechPatterns: val,
+        firstSeen: new Date().toISOString().split('T')[0],
+        lastSeen: new Date().toISOString().split('T')[0],
+        appearances: 1,
+        confidence: 'learning',
+        notes: ''
+      };
+    } else {
+      out[name] = { ...val, fullName: name };
+    }
+  }
+  return out;
+}
+
+function profileToPromptString(name: string, p: SpeakerProfile): string {
+  const parts = [
+    `Name: ${name}`,
+    p.aliases.length ? `Also known as: ${p.aliases.join(', ')}` : null,
+    p.role ? `Role: ${p.role}` : null,
+    p.topics.length ? `Typical topics: ${p.topics.join(', ')}` : null,
+    p.speechPatterns ? `Speech patterns: ${p.speechPatterns}` : null,
+    `Appearances: ${p.appearances} transcript(s) — confidence: ${p.confidence}`,
+    p.notes ? `Notes: ${p.notes}` : null,
+  ].filter(Boolean);
+  return parts.join(' | ');
+}
+
 // Quick date helpers
 const quickDates = [
   { label: 'Today', value: () => new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) },
@@ -151,23 +203,57 @@ function QuickDatePicker({ value, onChange }: { value: string; onChange: (v: str
 }
 
 // ─── Speaker Profile Card ─────────────────────────────────────────────────────
+const confidenceBadge: Record<string, string> = {
+  learning: 'bg-amber-100 text-amber-700 border-amber-200',
+  confirmed: 'bg-blue-100 text-blue-700 border-blue-200',
+  verified: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+};
+
 function SpeakerCard({
-  name, desc, onUpdate, onDelete
-}: { name: string; desc: string; onUpdate: (n: string, d: string) => void; onDelete: () => void }) {
+  name, profile, onUpdate, onDelete
+}: {
+  name: string;
+  profile: SpeakerProfile;
+  onUpdate: (n: string, updated: Partial<SpeakerProfile>) => void;
+  onDelete: () => void;
+}) {
   const [editing, setEditing] = useState(false);
   const [eName, setEName] = useState(name);
-  const [eDesc, setEDesc] = useState(desc);
+  const [eRole, setERole] = useState(profile.role || '');
+  const [ePatterns, setEPatterns] = useState(profile.speechPatterns || '');
+  const [eAliases, setEAliases] = useState((profile.aliases || []).join(', '));
+  const [eTopics, setETopics] = useState((profile.topics || []).join(', '));
+  const [eNotes, setENotes] = useState(profile.notes || '');
+  const [eConfidence, setEConfidence] = useState<'learning'|'confirmed'|'verified'>(profile.confidence || 'learning');
+
   const colors = ['bg-blue-100 text-blue-700', 'bg-emerald-100 text-emerald-700', 'bg-violet-100 text-violet-700', 'bg-amber-100 text-amber-700', 'bg-rose-100 text-rose-700'];
   const color = colors[name.charCodeAt(0) % colors.length];
-  const initials = name.split(' ').map(w => w[0]).join('').slice(0,2).toUpperCase();
+  const initials = name.split(' ').map((w: string) => w[0]).join('').slice(0,2).toUpperCase();
 
   if (editing) {
     return (
-      <div className="bg-white border border-blue-200 p-2.5 rounded-xl shadow-sm space-y-2">
-        <input value={eName} onChange={e => setEName(e.target.value)} className="w-full text-xs font-bold p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Speaker name" />
-        <textarea value={eDesc} onChange={e => setEDesc(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400" rows={3} placeholder="Description, role, speech patterns..." />
+      <div className="bg-white border border-blue-200 p-3 rounded-xl shadow-sm space-y-2">
+        <input value={eName} onChange={e => setEName(e.target.value)} className="w-full text-xs font-bold p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Full name" />
+        <input value={eRole} onChange={e => setERole(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Role (e.g. lawyer, journalist, witness)" />
+        <input value={eAliases} onChange={e => setEAliases(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Aliases, comma-separated" />
+        <input value={eTopics} onChange={e => setETopics(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Topics, comma-separated" />
+        <textarea value={ePatterns} onChange={e => setEPatterns(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400" rows={2} placeholder="Speech patterns, vocabulary, cadence..." />
+        <textarea value={eNotes} onChange={e => setENotes(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400" rows={2} placeholder="Extra notes for identification..." />
+        <select value={eConfidence} onChange={e => setEConfidence(e.target.value as any)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none bg-white">
+          <option value="learning">Learning</option>
+          <option value="confirmed">Confirmed</option>
+          <option value="verified">Verified</option>
+        </select>
         <div className="flex gap-1.5">
-          <button onClick={() => { onUpdate(eName, eDesc); setEditing(false); }} className="flex-1 text-[11px] font-bold bg-blue-600 text-white py-1 rounded-lg hover:bg-blue-700 transition-colors">Save</button>
+          <button onClick={() => {
+            onUpdate(eName, {
+              fullName: eName, role: eRole, speechPatterns: ePatterns, notes: eNotes,
+              aliases: eAliases.split(',').map(s => s.trim()).filter(Boolean),
+              topics: eTopics.split(',').map(s => s.trim()).filter(Boolean),
+              confidence: eConfidence,
+            });
+            setEditing(false);
+          }} className="flex-1 text-[11px] font-bold bg-blue-600 text-white py-1 rounded-lg hover:bg-blue-700 transition-colors">Save</button>
           <button onClick={() => setEditing(false)} className="px-2 text-[11px] bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 transition-colors">Cancel</button>
         </div>
       </div>
@@ -175,15 +261,35 @@ function SpeakerCard({
   }
 
   return (
-    <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-xl flex items-start gap-2.5 group hover:border-blue-200 hover:bg-blue-50/30 transition-all">
-      <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 text-[10px] font-extrabold ${color}`}>{initials}</div>
-      <div className="flex-1 min-w-0">
-        <p className="text-xs font-bold text-slate-800 truncate">{name}</p>
-        <p className="text-[10px] text-slate-500 mt-0.5 line-clamp-2 leading-relaxed">{desc}</p>
-      </div>
-      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-        <button onClick={() => setEditing(true)} className="p-1 hover:bg-blue-100 rounded transition-colors text-slate-400 hover:text-blue-600"><Pencil className="w-3 h-3" /></button>
-        <button onClick={onDelete} className="p-1 hover:bg-red-100 rounded transition-colors text-slate-400 hover:text-red-600"><X className="w-3 h-3" /></button>
+    <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-xl group hover:border-blue-200 hover:bg-blue-50/20 transition-all">
+      <div className="flex items-start gap-2.5">
+        <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 text-[10px] font-extrabold ${color}`}>{initials}</div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <p className="text-xs font-bold text-slate-800">{name}</p>
+            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${confidenceBadge[profile.confidence || 'learning']}`}>
+              {profile.confidence || 'learning'}
+            </span>
+            {profile.appearances > 0 && (
+              <span className="text-[9px] text-slate-400 font-medium">{profile.appearances}× seen</span>
+            )}
+          </div>
+          {profile.role && <p className="text-[10px] text-slate-500 mt-0.5">{profile.role}</p>}
+          {profile.topics?.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-1">
+              {profile.topics.slice(0,3).map(t => (
+                <span key={t} className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-full border border-slate-200">{t}</span>
+              ))}
+            </div>
+          )}
+          {profile.speechPatterns && (
+            <p className="text-[10px] text-slate-400 mt-1 line-clamp-2 italic">"{profile.speechPatterns}"</p>
+          )}
+        </div>
+        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+          <button onClick={() => setEditing(true)} className="p-1 hover:bg-blue-100 rounded transition-colors text-slate-400 hover:text-blue-600"><Pencil className="w-3 h-3" /></button>
+          <button onClick={onDelete} className="p-1 hover:bg-red-100 rounded transition-colors text-slate-400 hover:text-red-600"><X className="w-3 h-3" /></button>
+        </div>
       </div>
     </div>
   );
@@ -373,7 +479,7 @@ export default function App() {
   const [polishError, setPolishError] = useState('');
   const [copied, setCopied] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [speakerProfiles, setSpeakerProfiles] = useState<Record<string, string>>({});
+  const [speakerProfiles, setSpeakerProfiles] = useState<Record<string, SpeakerProfile>>({});
   const [chatOpen, setChatOpen] = useState(false);
   const [addingSpeaker, setAddingSpeaker] = useState(false);
   const [newSpeakerName, setNewSpeakerName] = useState('');
@@ -389,7 +495,7 @@ export default function App() {
       if (sv) setVideos(JSON.parse(sv));
       if (sb) setBookBreakdowns(JSON.parse(sb));
       if (sm) setMetaFields(JSON.parse(sm));
-      if (ss) setSpeakerProfiles(JSON.parse(ss));
+      if (ss) setSpeakerProfiles(migrateLegacyProfiles(JSON.parse(ss)));
     } catch (e) { console.error('localStorage load error', e); }
   }, []);
 
@@ -449,39 +555,63 @@ export default function App() {
     if (!activeVideo?.transcript) return;
     setGeneratingBreakdown(true); setPolishError('');
     try {
-      const prompt = `You are an expert research assistant and transcript diarizer helping an author gather information for a book. 
-      
-Context for this media:
-- Title: ${activeVideo.title}
-- Apparent Date of Event: ${activeMeta.date || 'Not specified'}
-- Participants/Speakers Hints: ${activeMeta.participants || 'Not specified'}
-- Tags: ${activeMeta.tags || 'Not specified'}
+      const today = new Date().toISOString().split('T')[0];
+      const knownSpeakersText = Object.keys(speakerProfiles).length > 0
+        ? Object.entries(speakerProfiles).map(([n, p]) => profileToPromptString(n, p)).join('\n')
+        : 'None yet.';
 
-Global Known Speakers (learned from previous videos):
-${JSON.stringify(speakerProfiles, null, 2)}
+      const prompt = `You are an expert forensic transcript analyst and diarizer. Your job is to identify every speaker in this transcript as precisely as possible, then produce structured research notes for a book author.
 
-Instructions:
-1. Analyze the transcript. Use participants hints and known speaker profiles to identify speakers.
-2. Provide a comprehensive breakdown in Markdown.
+=== VIDEO CONTEXT ===
+Title: ${activeVideo.title}
+Date of Event: ${activeMeta.date || 'Unknown'}
+Participants hint (user-provided): ${activeMeta.participants || 'None'}
+Tags: ${activeMeta.tags || 'None'}
+Video URL: ${activeVideo.url}
 
-Required Sections:
+=== KNOWN SPEAKER DATABASE (learned from previous transcripts) ===
+${knownSpeakersText}
+
+=== SPEAKER IDENTIFICATION INSTRUCTIONS ===
+STEP 1 — PRE-MATCH: Before reading the transcript, list which known speakers are LIKELY present based on the title, date, participants hint, and their known topics/roles.
+STEP 2 — ANALYZE: Read the transcript carefully. Match speech segments to known speakers using: name mentions, role references, topic expertise, speech patterns, and aliases.
+STEP 3 — UNKNOWN SPEAKERS: For any speaker you cannot match to a known profile, create a NEW profile. Name them descriptively (e.g. "Unknown Male Host", "Female Questioner") until identified.
+STEP 4 — CONFIDENCE: Mark each speaker assignment as (confirmed) if explicitly named in transcript, or (inferred) if matched by context.
+
+=== REQUIRED MARKDOWN OUTPUT ===
+
+## Speaker Identification
+List each identified speaker, how you identified them, and confidence level.
+
 ## Summary
-(Concise summary of the video/call)
+Concise summary of what happened.
 
 ## Key Themes & Entities
-(Bullet points: main topics, people mentioned, locations, facts, dates)
+Bullet points: main topics, people mentioned, locations, facts, key dates.
 
 ## Speaker Breakdown
-(Who spoke, what each person contributed)
+For each speaker: what they said, their position/argument/contribution.
 
 ## Diarized & Polished Transcript
-(Cleaned-up, readable version with **Speaker Name:** prepended to each paragraph)
+Full cleaned-up transcript. EVERY paragraph MUST start with **Speaker Name (confidence):** — e.g. **John Doe (confirmed):** or **Unknown Host (inferred):**.
+Fix transcription errors. Keep meaning intact.
 
-4. After the Markdown, provide a JSON block in \`\`\`json ... \`\`\` with updated speaker profiles dictionary.
-Keys = speaker names, Values = short description of role, speech patterns, topics.
+=== TRANSCRIPT ===
+${activeVideo.transcript}
 
-Transcript:
-${activeVideo.transcript}`;
+=== AFTER THE MARKDOWN, OUTPUT THIS JSON BLOCK ===
+Output a JSON block in \`\`\`json ... \`\`\` with the key "profiles" containing an array of speaker profile objects.
+Each object must have these fields (use empty string/array if unknown):
+{
+  "fullName": "string — best known name",
+  "aliases": ["array of alternate names/nicknames seen in this or past transcripts"],
+  "role": "string — journalist | lawyer | defendant | witness | host | etc.",
+  "topics": ["array of subjects they commonly discuss"],
+  "speechPatterns": "string — distinctive vocabulary, phrases, cadence, accent notes",
+  "confidence": "learning | confirmed | verified",
+  "notes": "string — any extra context useful for future identification"
+}
+Include ALL speakers found in this transcript. For existing known speakers, MERGE and UPDATE their data — do not lose previous information.`;
 
       const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
 
@@ -490,8 +620,28 @@ ${activeVideo.transcript}`;
         const jsonMatch = textResult.match(/```json\n([\s\S]*?)\n```/);
         if (jsonMatch?.[1]) {
           try {
-            const newProfiles = JSON.parse(jsonMatch[1]);
-            setSpeakerProfiles(prev => ({ ...prev, ...newProfiles }));
+            const parsed = JSON.parse(jsonMatch[1]);
+            const profilesArray: any[] = parsed.profiles || (Array.isArray(parsed) ? parsed : []);
+            setSpeakerProfiles(prev => {
+              const updated = { ...prev };
+              for (const p of profilesArray) {
+                const name = p.fullName || p.name || 'Unknown';
+                const existing = updated[name];
+                updated[name] = {
+                  fullName: name,
+                  aliases: [...new Set([...(existing?.aliases || []), ...(p.aliases || [])])],
+                  role: p.role || existing?.role || '',
+                  topics: [...new Set([...(existing?.topics || []), ...(p.topics || [])])],
+                  speechPatterns: p.speechPatterns || existing?.speechPatterns || '',
+                  firstSeen: existing?.firstSeen || today,
+                  lastSeen: today,
+                  appearances: (existing?.appearances || 0) + 1,
+                  confidence: p.confidence || existing?.confidence || 'learning',
+                  notes: [existing?.notes, p.notes].filter(Boolean).join(' | ') || '',
+                };
+              }
+              return updated;
+            });
             textResult = textResult.replace(/```json\n[\s\S]*?\n```/, '').trim();
           } catch (e) { console.error('Failed to parse speaker profiles', e); }
         }
@@ -523,8 +673,17 @@ ${activeVideo.transcript}`;
       out += `\n### Notes\n\n${bookBreakdowns[v.url] || '*No notes yet.*'}\n\n---\n\n`;
     });
     if (Object.keys(speakerProfiles).length > 0) {
-      out += `## Speaker Profiles\n\n`;
-      Object.entries(speakerProfiles).forEach(([n,d]) => { out += `- **${n}:** ${d}\n`; });
+      out += `## Speaker Profiles Registry\n\n`;
+      Object.entries(speakerProfiles).forEach(([n, p]: [string, any]) => {
+        out += `### ${n}\n`;
+        out += `- **Role:** ${p.role || 'Unknown'}\n`;
+        out += `- **Confidence:** ${p.confidence || 'learning'} | **Appearances:** ${p.appearances || 0}\n`;
+        if (p.aliases?.length) out += `- **Aliases:** ${p.aliases.join(', ')}\n`;
+        if (p.topics?.length) out += `- **Topics:** ${p.topics.join(', ')}\n`;
+        if (p.speechPatterns) out += `- **Speech patterns:** ${p.speechPatterns}\n`;
+        if (p.notes) out += `- **Notes:** ${p.notes}\n`;
+        out += `\n`;
+      });
     }
     const blob = new Blob([out], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
@@ -534,15 +693,32 @@ ${activeVideo.transcript}`;
 
   const addSpeaker = () => {
     if (!newSpeakerName.trim()) return;
-    setSpeakerProfiles(prev => ({ ...prev, [newSpeakerName.trim()]: newSpeakerDesc.trim() }));
+    const today = new Date().toISOString().split('T')[0];
+    const name = newSpeakerName.trim();
+    setSpeakerProfiles(prev => ({
+      ...prev,
+      [name]: {
+        fullName: name,
+        aliases: [],
+        role: '',
+        topics: [],
+        speechPatterns: newSpeakerDesc.trim(),
+        firstSeen: today,
+        lastSeen: today,
+        appearances: 0,
+        confidence: 'learning',
+        notes: newSpeakerDesc.trim(),
+      }
+    }));
     setNewSpeakerName(''); setNewSpeakerDesc(''); setAddingSpeaker(false);
   };
 
-  const updateSpeaker = (oldName: string, newName: string, newDesc: string) => {
+  const updateSpeaker = (oldName: string, newName: string, updatedProfile: Partial<SpeakerProfile>) => {
     setSpeakerProfiles(prev => {
       const updated = { ...prev };
+      const existing = updated[oldName] || {} as SpeakerProfile;
       if (oldName !== newName) delete updated[oldName];
-      updated[newName] = newDesc;
+      updated[newName] = { ...existing, ...updatedProfile, fullName: newName };
       return updated;
     });
   };
@@ -762,10 +938,10 @@ ${activeVideo.transcript}`;
                       {Object.keys(speakerProfiles).length === 0 && !addingSpeaker && (
                         <p className="text-[11px] text-slate-400 italic text-center py-3">No voices learned yet. Generate a breakdown or add one manually.</p>
                       )}
-                      {Object.entries(speakerProfiles).map(([name, desc]) => (
+                      {Object.entries(speakerProfiles).map(([name, profile]) => (
                         <SpeakerCard
-                          key={name} name={name} desc={desc as string}
-                          onUpdate={(n, d) => updateSpeaker(name, n, d)}
+                          key={name} name={name} profile={profile as SpeakerProfile}
+                          onUpdate={(n, updated) => updateSpeaker(name, n, updated)}
                           onDelete={() => deleteSpeaker(name)}
                         />
                       ))}
