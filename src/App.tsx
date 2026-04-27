@@ -59,16 +59,21 @@ export default function App() {
   const [copied, setCopied] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
 
+  // Global Learned Speakers Profiles
+  const [speakerProfiles, setSpeakerProfiles] = useState<Record<string, string>>({});
+
   // Auto-save: Load on mount
   useEffect(() => {
     try {
       const savedVideos = localStorage.getItem('ytAnalyzer_videos');
       const savedBreakdowns = localStorage.getItem('ytAnalyzer_breakdowns');
       const savedMeta = localStorage.getItem('ytAnalyzer_meta');
+      const savedSpeakers = localStorage.getItem('ytAnalyzer_speakers');
       
       if (savedVideos) setVideos(JSON.parse(savedVideos));
       if (savedBreakdowns) setBookBreakdowns(JSON.parse(savedBreakdowns));
       if (savedMeta) setMetaFields(JSON.parse(savedMeta));
+      if (savedSpeakers) setSpeakerProfiles(JSON.parse(savedSpeakers));
     } catch (e) {
       console.error("Failed to load local storage", e);
     }
@@ -87,14 +92,20 @@ export default function App() {
     if (Object.keys(metaFields).length > 0) localStorage.setItem('ytAnalyzer_meta', JSON.stringify(metaFields));
   }, [metaFields]);
 
+  useEffect(() => {
+    if (Object.keys(speakerProfiles).length > 0) localStorage.setItem('ytAnalyzer_speakers', JSON.stringify(speakerProfiles));
+  }, [speakerProfiles]);
+
   const clearAllData = () => {
-    if (!confirm('Are you sure you want to clear all saved videos and notes?')) return;
+    if (!confirm('Are you sure you want to clear all saved videos, notes, and learned voices?')) return;
     localStorage.removeItem('ytAnalyzer_videos');
     localStorage.removeItem('ytAnalyzer_breakdowns');
     localStorage.removeItem('ytAnalyzer_meta');
+    localStorage.removeItem('ytAnalyzer_speakers');
     setVideos([]);
     setBookBreakdowns({});
     setMetaFields({});
+    setSpeakerProfiles({});
     setActiveVideoIndex(0);
     setUrlsInput('');
   };
@@ -158,26 +169,37 @@ export default function App() {
     setPolishError('');
     
     try {
-      const prompt = `You are an expert research assistant helping an author gather information for a book from video and call transcripts. 
+      const prompt = `You are an expert research assistant and transcript diarizer helping an author gather information for a book. 
       
-      The author has provided the following context for this media:
+      Context for this media:
       - Apparent Date of Event: ${activeMeta.date || 'Not specified by author'}
-      - Participants/Speakers: ${activeMeta.participants || 'Not specified by author'}
+      - Participants/Speakers Hints: ${activeMeta.participants || 'Not specified by author'}
       
-      Please analyze the following transcript and provide a comprehensive breakdown in Markdown format. 
+      Global Known Speakers (learned from previous videos):
+      ${JSON.stringify(speakerProfiles, null, 2)}
 
-      Required Sections:
+      Instructions:
+      1. Analyze the transcript text. It may lack speaker labels.
+      2. Use the "Participants" hints and the "Global Known Speakers" profiles to identify who is speaking. Try to assign every paragraph to a speaker. Look for contextual clues like introductions, topics of expertise, and speech patterns.
+      3. Provide a comprehensive breakdown in Markdown format.
+
+      Required Sections in Markdown:
       ## Summary
       (A concise summary of the video/call's contents)
 
       ## Key Themes & Entities
-      (Bullet points of main topics, people mentioned, locations, facts, or concepts)
+      (Bullet points of main topics, people mentioned, locations, facts)
 
       ## Speaker Breakdown
-      (Identify who is speaking based on the author's participant context and the flow of the transcript. Summarize what each person contributed)
+      (Identify who spoke in this video. Summarize what each person contributed)
 
-      ## Polished Transcript
-      (Provide a cleaned-up, highly readable version of the transcript with paragraphs and corrected obvious errors. Do not change the original meaning.)
+      ## Diarized & Polished Transcript
+      (Provide a cleaned-up, highly readable version of the transcript with paragraphs. PREPEND EACH PARAGRAPH WITH THE IDENTIFIED SPEAKER'S NAME in bold, like **John Doe:**. Fix obvious errors without changing the meaning.)
+
+      4. IMPORTANT: After your Markdown output, provide a JSON block enclosed in \`\`\`json ... \`\`\` that contains an updated dictionary of speaker profiles. 
+      - Keys should be speaker names.
+      - Values should be a short string describing their role, unique speech patterns, and common topics (to help identify them in future unlabeled transcripts).
+      - Include both newly discovered speakers from this video and existing ones with updated context.
       
       Transcript text:
       ${activeVideo.transcript}`;
@@ -188,6 +210,20 @@ export default function App() {
       });
 
       if (response.text) {
+        let textResult = response.text;
+        
+        // Extract JSON profiles if present
+        const jsonMatch = textResult.match(/```json\n([\s\S]*?)\n```/);
+        if (jsonMatch && jsonMatch[1]) {
+          try {
+            const newProfiles = JSON.parse(jsonMatch[1]);
+            setSpeakerProfiles(prev => ({...prev, ...newProfiles}));
+            textResult = textResult.replace(/```json\n[\s\S]*?\n```/, '').trim();
+          } catch (e) {
+            console.error("Failed to parse speaker profiles JSON", e);
+          }
+        }
+
         const finalBreakdown = 
 `**Reference URL:** ${activeVideo.url}
 **Event Date:** ${activeMeta.date || 'Not specified'}
@@ -195,7 +231,7 @@ export default function App() {
 
 ---
 
-${response.text}`;
+${textResult}`;
         setBookBreakdowns(prev => ({
           ...prev,
           [activeVideo.url]: finalBreakdown
@@ -214,6 +250,48 @@ ${response.text}`;
     navigator.clipboard.writeText(currentBreakdown);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const exportAllData = () => {
+    if (videos.length === 0) return;
+    
+    let fullExport = `# Book Research: Video Transcripts and Notes\n\n`;
+    fullExport += `*Generated on: ${new Date().toLocaleDateString()}*\n\n---\n\n`;
+
+    videos.forEach((v) => {
+      fullExport += `## Video: ${v.title || v.url}\n`;
+      fullExport += `- **URL:** ${v.url}\n`;
+      const meta = metaFields[v.url];
+      if (meta) {
+        fullExport += `- **Date:** ${meta.date || 'Not specified'}\n`;
+        fullExport += `- **Participants:** ${meta.participants || 'Not specified'}\n`;
+      }
+      fullExport += `\n### Notes & Analysis\n\n`;
+      const breakdown = bookBreakdowns[v.url];
+      if (breakdown) {
+        fullExport += `${breakdown}\n\n`;
+      } else {
+        fullExport += `*No notes generated for this video yet.*\n\n`;
+      }
+      fullExport += `---\n\n`;
+    });
+
+    if (Object.keys(speakerProfiles).length > 0) {
+       fullExport += `## Master Speaker Profiles Registry\n\n`;
+       Object.entries(speakerProfiles).forEach(([name, desc]) => {
+         fullExport += `- **${name}:** ${desc}\n`;
+       });
+    }
+
+    const blob = new Blob([fullExport], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `book-research-export-${new Date().toISOString().split('T')[0]}.md`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -250,13 +328,22 @@ ${response.text}`;
 
         <div className="flex items-center gap-4 hidden sm:flex shrink-0">
           {videos.length > 0 && (
-            <button 
-              onClick={clearAllData}
-              className="text-xs font-medium text-slate-500 hover:text-red-600 flex items-center gap-1.5 transition-colors"
-              title="Clear all saved videos and transcripts"
-            >
-              <Trash2 className="w-4 h-4" /> Clear Data
-            </button>
+            <>
+              <button 
+                onClick={exportAllData}
+                className="text-xs font-medium bg-blue-50 text-blue-700 hover:bg-blue-100 px-3 py-1.5 rounded flex items-center gap-1.5 transition-colors"
+                title="Download all generated notes as a single Markdown file"
+              >
+                <Save className="w-4 h-4" /> Export All
+              </button>
+              <button 
+                onClick={clearAllData}
+                className="text-xs font-medium text-slate-500 hover:text-red-600 flex items-center gap-1.5 transition-colors"
+                title="Clear all saved videos and transcripts"
+              >
+                <Trash2 className="w-4 h-4" /> Clear Data
+              </button>
+            </>
           )}
           <div className="flex items-center gap-2 bg-green-50 px-3 py-1 rounded-full border border-green-100">
             <div className="w-2 h-2 bg-green-500 rounded-full"></div>
@@ -338,10 +425,27 @@ ${response.text}`;
                       value={activeMeta.participants} 
                       onChange={(e) => updateMeta('participants', e.target.value)} 
                       placeholder="Who is in this call/video?" 
-                      className="w-full text-sm p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none resize-none flex-1 min-h-[120px] placeholder:text-slate-300 transition-shadow" 
+                      className="w-full text-sm p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none resize-none flex-1 min-h-[60px] max-h-[100px] placeholder:text-slate-300 transition-shadow" 
                     />
                   </div>
                 </div>
+
+                {Object.keys(speakerProfiles).length > 0 && (
+                  <div className="pt-6 border-t border-slate-100">
+                    <h3 className="text-sm font-bold uppercase tracking-wider text-slate-800 mb-3 flex items-center justify-between">
+                      Learned Voices
+                      <span className="bg-blue-100 text-blue-700 font-bold px-2 py-0.5 rounded text-[10px]">{Object.keys(speakerProfiles).length}</span>
+                    </h3>
+                    <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+                      {Object.entries(speakerProfiles).map(([name, desc]) => (
+                        <div key={name} className="bg-slate-50 border border-slate-200 p-2.5 rounded-lg">
+                          <p className="text-xs font-bold text-slate-700">{name}</p>
+                          <p className="text-[10px] text-slate-500 mt-1 line-clamp-3 leading-relaxed">{desc}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </aside>
 
