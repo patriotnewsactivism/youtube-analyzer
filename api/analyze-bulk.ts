@@ -21,8 +21,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const results = await Promise.all(
     urls.map(async (url: string) => {
       try {
-        const videoResult = await supadata.youtube.video({ id: url });
-        const transcriptResult: any = await supadata.transcript({ url, text: true });
+        // Correct SDK methods per Supadata docs
+        const [metaResult, transcriptResult]: [any, any] = await Promise.all([
+          supadata.metadata({ url }),
+          supadata.transcript({ url, text: true }),
+        ]);
 
         let transcriptText = '';
         if (transcriptResult?.jobId) {
@@ -40,8 +43,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return {
           url,
           success: true,
-          title: videoResult.title,
-          description: videoResult.description,
+          title: metaResult.title,
+          description: metaResult.description,
           transcript: transcriptText,
         };
       } catch (err: any) {
