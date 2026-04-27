@@ -1,491 +1,84 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { GoogleGenAI } from '@google/genai';
 import {
   Loader2, Youtube, Sparkles, AlertCircle, Copy, CheckCircle,
-  Trash2, Search, Zap, Layers, BookOpen, Save, MessageSquare,
-  X, Send, User, Bot, ChevronDown, Plus, Pencil, Calendar,
-  FileText, Tag, Users, Clock, BarChart2, ExternalLink, Download
+  Trash2, Search, Zap, Save, MessageSquare, X, Plus, Pencil,
+  Calendar, FileText, Tag, Users, BarChart2, ExternalLink,
+  Download, Clock, BookOpen, GitCompare, Quote, AlignLeft,
+  User
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 
-const getYoutubeId = (url: string) => {
-  if (!url) return null;
-  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
-  const match = url.match(regExp);
-  return (match && match[2].length === 11) ? match[2] : null;
-};
+import type { Video, VideoMeta, SpeakerProfile, ChatMessage } from './lib/types';
+import {
+  getYoutubeId, wordCount, readTime, defaultMeta,
+  migrateLegacyProfiles, profileToPromptString, CONFIDENCE_STYLES
+} from './lib/utils';
+import QuickDatePicker from './components/QuickDatePicker';
+import SpeakerCard from './components/SpeakerCard';
+import ChatPanel from './components/ChatPanel';
+import TimelineView from './components/TimelineView';
+import CrossSearch from './components/CrossSearch';
+import ContradictionDetector from './components/ContradictionDetector';
+import QuoteExtractor from './components/QuoteExtractor';
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// ─── Speaker Profile Schema ───────────────────────────────────────────────────
-// Rich structured profiles so AI can match speakers across many transcripts
-interface SpeakerProfile {
-  fullName: string;
-  aliases: string[];           // nicknames, partial names the AI might see
-  role: string;                // journalist, defendant, lawyer, witness, etc.
-  topics: string[];            // recurring subjects they discuss
-  speechPatterns: string;      // distinctive phrases, cadence, vocabulary
-  firstSeen: string;           // ISO date of first transcript
-  lastSeen: string;            // ISO date of most recent transcript
-  appearances: number;         // how many transcripts they've appeared in
-  confidence: 'learning' | 'confirmed' | 'verified';
-  notes: string;               // any extra context
-}
-
-// Convert legacy string profiles to new schema on load
-function migrateLegacyProfiles(raw: Record<string, any>): Record<string, SpeakerProfile> {
-  const out: Record<string, SpeakerProfile> = {};
-  for (const [name, val] of Object.entries(raw)) {
-    if (typeof val === 'string') {
-      out[name] = {
-        fullName: name,
-        aliases: [],
-        role: '',
-        topics: [],
-        speechPatterns: val,
-        firstSeen: new Date().toISOString().split('T')[0],
-        lastSeen: new Date().toISOString().split('T')[0],
-        appearances: 1,
-        confidence: 'learning',
-        notes: ''
-      };
-    } else {
-      out[name] = { ...val, fullName: name };
-    }
-  }
-  return out;
-}
-
-function profileToPromptString(name: string, p: SpeakerProfile): string {
-  const parts = [
-    `Name: ${name}`,
-    p.aliases.length ? `Also known as: ${p.aliases.join(', ')}` : null,
-    p.role ? `Role: ${p.role}` : null,
-    p.topics.length ? `Typical topics: ${p.topics.join(', ')}` : null,
-    p.speechPatterns ? `Speech patterns: ${p.speechPatterns}` : null,
-    `Appearances: ${p.appearances} transcript(s) — confidence: ${p.confidence}`,
-    p.notes ? `Notes: ${p.notes}` : null,
-  ].filter(Boolean);
-  return parts.join(' | ');
-}
-
-// Quick date helpers
-const quickDates = [
-  { label: 'Today', value: () => new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) },
-  { label: 'Yesterday', value: () => { const d = new Date(); d.setDate(d.getDate()-1); return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }); } },
-  { label: 'This Week', value: () => { const d = new Date(); return `Week of ${d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`; } },
-  { label: 'Last Week', value: () => { const d = new Date(); d.setDate(d.getDate()-7); return `Week of ${d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`; } },
-  { label: 'This Month', value: () => new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }) },
-  { label: 'Last Month', value: () => { const d = new Date(); d.setMonth(d.getMonth()-1); return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' }); } },
-];
-
-// Word count utility
-const wordCount = (text: string) => text ? text.trim().split(/\s+/).filter(Boolean).length : 0;
-const readTime = (text: string) => Math.max(1, Math.ceil(wordCount(text) / 200));
-
-// Highlighting Helpers
+// ─── Highlight helpers ────────────────────────────────────────────────────────
 const highlightText = (text: string, query: string): React.ReactNode => {
   if (!query.trim() || !text) return text;
   const parts = String(text).split(new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'));
   return parts.map((p, i) =>
     p.toLowerCase() === query.toLowerCase()
-      ? <span key={i} className="bg-yellow-300 text-yellow-900 font-medium rounded-sm px-0.5">{p}</span>
+      ? <mark key={i} className="bg-yellow-300 text-yellow-900 font-medium rounded-sm px-0.5">{p}</mark>
       : p
   );
 };
 
 const highlightChildren = (children: React.ReactNode, query: string): React.ReactNode => {
   if (!query.trim()) return children;
-  return React.Children.map(children, (child) => {
+  return React.Children.map(children, child => {
     if (typeof child === 'string') return highlightText(child, query);
     if (React.isValidElement(child)) {
-      return React.cloneElement(
-        child as React.ReactElement,
-        (child as React.ReactElement).props,
-        highlightChildren((child as React.ReactElement).props.children, query)
-      );
+      return React.cloneElement(child as React.ReactElement, (child as React.ReactElement).props,
+        highlightChildren((child as React.ReactElement).props.children, query));
     }
     return child;
   });
 };
 
-// ─── Chat Types ───────────────────────────────────────────────────────────────
-interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
-  timestamp: Date;
-}
+// ─── Tab config ───────────────────────────────────────────────────────────────
+type Tab = 'research' | 'timeline' | 'search' | 'contradictions' | 'quotes';
 
-// ─── Quick Date Picker ────────────────────────────────────────────────────────
-function QuickDatePicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [open, setOpen] = useState(false);
-  const [customYear, setCustomYear] = useState('');
-  const [customMonth, setCustomMonth] = useState('');
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const handler = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, []);
-
-  const applyCustom = () => {
-    const parts = [customMonth, customYear].filter(Boolean);
-    if (parts.length) { onChange(parts.join(' ')); setOpen(false); }
-  };
-
-  const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
-
-  return (
-    <div className="relative" ref={ref}>
-      <div className="flex gap-1.5">
-        <input
-          type="text"
-          value={value}
-          onChange={e => onChange(e.target.value)}
-          placeholder="e.g. Fall 2023, March 15 2022"
-          className="flex-1 text-sm p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none placeholder:text-slate-300 transition-shadow"
-        />
-        <button
-          type="button"
-          onClick={() => setOpen(o => !o)}
-          className="px-2 py-2 bg-blue-50 border border-blue-200 rounded-lg text-blue-600 hover:bg-blue-100 transition-colors"
-          title="Quick date picker"
-        >
-          <Calendar className="w-4 h-4" />
-        </button>
-      </div>
-      {open && (
-        <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-xl shadow-xl p-3 space-y-3">
-          <div className="grid grid-cols-2 gap-1.5">
-            {quickDates.map(qd => (
-              <button
-                key={qd.label}
-                type="button"
-                onClick={() => { onChange(qd.value()); setOpen(false); }}
-                className="text-xs font-medium text-left px-2.5 py-1.5 rounded-lg bg-slate-50 hover:bg-blue-50 hover:text-blue-700 border border-slate-100 transition-colors"
-              >
-                {qd.label}
-              </button>
-            ))}
-          </div>
-          <div className="border-t border-slate-100 pt-2">
-            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Custom</p>
-            <div className="flex gap-1.5">
-              <select
-                value={customMonth}
-                onChange={e => setCustomMonth(e.target.value)}
-                className="flex-1 text-xs p-1.5 border border-slate-200 rounded-lg bg-white outline-none"
-              >
-                <option value="">Month</option>
-                {months.map(m => <option key={m} value={m}>{m}</option>)}
-              </select>
-              <input
-                type="number"
-                value={customYear}
-                onChange={e => setCustomYear(e.target.value)}
-                placeholder="Year"
-                className="w-20 text-xs p-1.5 border border-slate-200 rounded-lg outline-none"
-              />
-              <button
-                type="button"
-                onClick={applyCustom}
-                className="px-2 py-1 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 transition-colors font-semibold"
-              >
-                Set
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Speaker Profile Card ─────────────────────────────────────────────────────
-const confidenceBadge: Record<string, string> = {
-  learning: 'bg-amber-100 text-amber-700 border-amber-200',
-  confirmed: 'bg-blue-100 text-blue-700 border-blue-200',
-  verified: 'bg-emerald-100 text-emerald-700 border-emerald-200',
-};
-
-function SpeakerCard({
-  name, profile, onUpdate, onDelete
-}: {
-  name: string;
-  profile: SpeakerProfile;
-  onUpdate: (n: string, updated: Partial<SpeakerProfile>) => void;
-  onDelete: () => void;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [eName, setEName] = useState(name);
-  const [eRole, setERole] = useState(profile.role || '');
-  const [ePatterns, setEPatterns] = useState(profile.speechPatterns || '');
-  const [eAliases, setEAliases] = useState((profile.aliases || []).join(', '));
-  const [eTopics, setETopics] = useState((profile.topics || []).join(', '));
-  const [eNotes, setENotes] = useState(profile.notes || '');
-  const [eConfidence, setEConfidence] = useState<'learning'|'confirmed'|'verified'>(profile.confidence || 'learning');
-
-  const colors = ['bg-blue-100 text-blue-700', 'bg-emerald-100 text-emerald-700', 'bg-violet-100 text-violet-700', 'bg-amber-100 text-amber-700', 'bg-rose-100 text-rose-700'];
-  const color = colors[name.charCodeAt(0) % colors.length];
-  const initials = name.split(' ').map((w: string) => w[0]).join('').slice(0,2).toUpperCase();
-
-  if (editing) {
-    return (
-      <div className="bg-white border border-blue-200 p-3 rounded-xl shadow-sm space-y-2">
-        <input value={eName} onChange={e => setEName(e.target.value)} className="w-full text-xs font-bold p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Full name" />
-        <input value={eRole} onChange={e => setERole(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Role (e.g. lawyer, journalist, witness)" />
-        <input value={eAliases} onChange={e => setEAliases(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Aliases, comma-separated" />
-        <input value={eTopics} onChange={e => setETopics(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400" placeholder="Topics, comma-separated" />
-        <textarea value={ePatterns} onChange={e => setEPatterns(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400" rows={2} placeholder="Speech patterns, vocabulary, cadence..." />
-        <textarea value={eNotes} onChange={e => setENotes(e.target.value)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400" rows={2} placeholder="Extra notes for identification..." />
-        <select value={eConfidence} onChange={e => setEConfidence(e.target.value as any)} className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none bg-white">
-          <option value="learning">Learning</option>
-          <option value="confirmed">Confirmed</option>
-          <option value="verified">Verified</option>
-        </select>
-        <div className="flex gap-1.5">
-          <button onClick={() => {
-            onUpdate(eName, {
-              fullName: eName, role: eRole, speechPatterns: ePatterns, notes: eNotes,
-              aliases: eAliases.split(',').map(s => s.trim()).filter(Boolean),
-              topics: eTopics.split(',').map(s => s.trim()).filter(Boolean),
-              confidence: eConfidence,
-            });
-            setEditing(false);
-          }} className="flex-1 text-[11px] font-bold bg-blue-600 text-white py-1 rounded-lg hover:bg-blue-700 transition-colors">Save</button>
-          <button onClick={() => setEditing(false)} className="px-2 text-[11px] bg-slate-100 text-slate-600 rounded-lg hover:bg-slate-200 transition-colors">Cancel</button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="bg-slate-50 border border-slate-200 p-2.5 rounded-xl group hover:border-blue-200 hover:bg-blue-50/20 transition-all">
-      <div className="flex items-start gap-2.5">
-        <div className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 text-[10px] font-extrabold ${color}`}>{initials}</div>
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 flex-wrap">
-            <p className="text-xs font-bold text-slate-800">{name}</p>
-            <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${confidenceBadge[profile.confidence || 'learning']}`}>
-              {profile.confidence || 'learning'}
-            </span>
-            {profile.appearances > 0 && (
-              <span className="text-[9px] text-slate-400 font-medium">{profile.appearances}× seen</span>
-            )}
-          </div>
-          {profile.role && <p className="text-[10px] text-slate-500 mt-0.5">{profile.role}</p>}
-          {profile.topics?.length > 0 && (
-            <div className="flex flex-wrap gap-1 mt-1">
-              {profile.topics.slice(0,3).map(t => (
-                <span key={t} className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded-full border border-slate-200">{t}</span>
-              ))}
-            </div>
-          )}
-          {profile.speechPatterns && (
-            <p className="text-[10px] text-slate-400 mt-1 line-clamp-2 italic">"{profile.speechPatterns}"</p>
-          )}
-        </div>
-        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
-          <button onClick={() => setEditing(true)} className="p-1 hover:bg-blue-100 rounded transition-colors text-slate-400 hover:text-blue-600"><Pencil className="w-3 h-3" /></button>
-          <button onClick={onDelete} className="p-1 hover:bg-red-100 rounded transition-colors text-slate-400 hover:text-red-600"><X className="w-3 h-3" /></button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── AI Chat Panel ────────────────────────────────────────────────────────────
-function ChatPanel({
-  open, onClose, activeVideo, currentBreakdown, speakerProfiles
-}: {
-  open: boolean;
-  onClose: () => void;
-  activeVideo: any;
-  currentBreakdown: string;
-  speakerProfiles: Record<string, string>;
-}) {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: 'assistant',
-      content: "Hi! I'm your research assistant. I have full context of the current video, transcript, and notes. Ask me anything — clarify errors, get a quote, expand on a topic, or add a speaker profile.",
-      timestamp: new Date()
-    }
-  ]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const bottomRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const sendMessage = async () => {
-    if (!input.trim() || loading) return;
-    const userMsg: ChatMessage = { role: 'user', content: input.trim(), timestamp: new Date() };
-    setMessages(prev => [...prev, userMsg]);
-    setInput('');
-    setLoading(true);
-
-    try {
-      const systemContext = `You are an expert research assistant embedded in a YouTube transcript analysis tool. 
-      
-Current video context:
-- Title: ${activeVideo?.title || 'No video loaded'}
-- URL: ${activeVideo?.url || ''}
-- Transcript (first 8000 chars): ${(activeVideo?.transcript || '').slice(0, 8000)}
-
-Generated notes/breakdown:
-${currentBreakdown ? currentBreakdown.slice(0, 4000) : 'No breakdown generated yet.'}
-
-Known speaker profiles:
-${JSON.stringify(speakerProfiles, null, 2)}
-
-You can help the user:
-- Understand or clarify parts of the transcript
-- Fix errors or inconsistencies in the notes
-- Answer questions about the content
-- Identify speakers
-- Extract specific quotes or facts
-- Suggest edits to speaker profiles
-Be concise, direct, and helpful. Format responses with markdown when useful.`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `${systemContext}\n\nUser question: ${userMsg.content}`,
-      });
-
-      const assistantMsg: ChatMessage = {
-        role: 'assistant',
-        content: response.text || 'No response.',
-        timestamp: new Date()
-      };
-      setMessages(prev => [...prev, assistantMsg]);
-    } catch (err: any) {
-      setMessages(prev => [...prev, {
-        role: 'assistant',
-        content: `Error: ${err.message || 'Something went wrong.'}`,
-        timestamp: new Date()
-      }]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-  };
-
-  if (!open) return null;
-
-  return (
-    <div className="w-96 bg-white border-l border-slate-200 flex flex-col shrink-0 shadow-xl z-10">
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between bg-gradient-to-r from-blue-600 to-indigo-600">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 bg-white/20 rounded-lg flex items-center justify-center">
-            <Bot className="w-4 h-4 text-white" />
-          </div>
-          <div>
-            <p className="text-sm font-bold text-white">Research Assistant</p>
-            <p className="text-[10px] text-blue-100">Powered by Gemini</p>
-          </div>
-        </div>
-        <button onClick={onClose} className="p-1.5 hover:bg-white/20 rounded-lg transition-colors text-white">
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-
-      {/* Context banner */}
-      {activeVideo && (
-        <div className="px-3 py-2 bg-blue-50 border-b border-blue-100 flex items-center gap-2">
-          <FileText className="w-3.5 h-3.5 text-blue-500 shrink-0" />
-          <p className="text-[10px] text-blue-700 font-medium truncate">Context: {activeVideo.title}</p>
-        </div>
-      )}
-
-      {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
-        {messages.map((msg, i) => (
-          <div key={i} className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
-            <div className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${msg.role === 'user' ? 'bg-blue-600' : 'bg-slate-200'}`}>
-              {msg.role === 'user' ? <User className="w-3 h-3 text-white" /> : <Bot className="w-3 h-3 text-slate-600" />}
-            </div>
-            <div className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${msg.role === 'user' ? 'bg-blue-600 text-white rounded-tr-sm' : 'bg-slate-100 text-slate-800 rounded-tl-sm'}`}>
-              {msg.role === 'assistant' ? (
-                <div className="markdown-chat prose prose-sm max-w-none">
-                  <Markdown>{msg.content}</Markdown>
-                </div>
-              ) : msg.content}
-              <p className={`text-[9px] mt-1 ${msg.role === 'user' ? 'text-blue-200' : 'text-slate-400'}`}>
-                {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-              </p>
-            </div>
-          </div>
-        ))}
-        {loading && (
-          <div className="flex gap-2">
-            <div className="w-6 h-6 rounded-full bg-slate-200 flex items-center justify-center shrink-0">
-              <Bot className="w-3 h-3 text-slate-600" />
-            </div>
-            <div className="bg-slate-100 rounded-2xl rounded-tl-sm px-3 py-2.5">
-              <div className="flex gap-1">
-                <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                <span className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-              </div>
-            </div>
-          </div>
-        )}
-        <div ref={bottomRef} />
-      </div>
-
-      {/* Input */}
-      <div className="p-3 border-t border-slate-200">
-        <div className="flex gap-2 items-end">
-          <textarea
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask about the transcript, errors, speakers..."
-            className="flex-1 text-sm p-2.5 bg-slate-50 border border-slate-200 rounded-xl resize-none outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-300 transition-all max-h-32 min-h-[40px]"
-            rows={1}
-            disabled={loading}
-          />
-          <button
-            onClick={sendMessage}
-            disabled={loading || !input.trim()}
-            className="p-2.5 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
-          >
-            <Send className="w-4 h-4" />
-          </button>
-        </div>
-        <p className="text-[10px] text-slate-400 mt-1.5 text-center">Enter to send · Shift+Enter for newline</p>
-      </div>
-    </div>
-  );
-}
+const TABS: { id: Tab; label: string; icon: React.ElementType; requiresVideos?: boolean }[] = [
+  { id: 'research',       label: 'Research',       icon: AlignLeft },
+  { id: 'timeline',       label: 'Timeline',        icon: Clock,        requiresVideos: true },
+  { id: 'search',         label: 'Cross-Search',    icon: Search,       requiresVideos: true },
+  { id: 'contradictions', label: 'Contradictions',  icon: GitCompare,   requiresVideos: true },
+  { id: 'quotes',         label: 'Quotes',          icon: Quote,        requiresVideos: true },
+];
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [urlsInput, setUrlsInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [videos, setVideos] = useState<any[]>([]);
+  const [urlsInput, setUrlsInput]   = useState('');
+  const [loading, setLoading]       = useState(false);
+  const [error, setError]           = useState('');
+  const [videos, setVideos]         = useState<Video[]>([]);
   const [activeVideoIndex, setActiveVideoIndex] = useState(0);
-  const [metaFields, setMetaFields] = useState<Record<string, { date: string; participants: string; tags: string }>>({});
+  const [metaFields, setMetaFields] = useState<Record<string, VideoMeta>>({});
   const [generatingBreakdown, setGeneratingBreakdown] = useState(false);
   const [bookBreakdowns, setBookBreakdowns] = useState<Record<string, string>>({});
   const [polishError, setPolishError] = useState('');
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied]         = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [speakerProfiles, setSpeakerProfiles] = useState<Record<string, SpeakerProfile>>({});
-  const [chatOpen, setChatOpen] = useState(false);
+  const [chatOpen, setChatOpen]     = useState(false);
   const [addingSpeaker, setAddingSpeaker] = useState(false);
   const [newSpeakerName, setNewSpeakerName] = useState('');
   const [newSpeakerDesc, setNewSpeakerDesc] = useState('');
+  const [activeTab, setActiveTab]   = useState<Tab>('research');
 
-  // Load from localStorage
+  // ── Load from localStorage ─────────────────────────────────────────────────
   useEffect(() => {
     try {
       const sv = localStorage.getItem('ytAnalyzer_videos');
@@ -496,28 +89,28 @@ export default function App() {
       if (sb) setBookBreakdowns(JSON.parse(sb));
       if (sm) setMetaFields(JSON.parse(sm));
       if (ss) setSpeakerProfiles(migrateLegacyProfiles(JSON.parse(ss)));
-    } catch (e) { console.error('localStorage load error', e); }
+    } catch (e) { console.error('localStorage load', e); }
   }, []);
 
-  useEffect(() => { if (videos.length > 0) localStorage.setItem('ytAnalyzer_videos', JSON.stringify(videos)); }, [videos]);
-  useEffect(() => { if (Object.keys(bookBreakdowns).length > 0) localStorage.setItem('ytAnalyzer_breakdowns', JSON.stringify(bookBreakdowns)); }, [bookBreakdowns]);
-  useEffect(() => { if (Object.keys(metaFields).length > 0) localStorage.setItem('ytAnalyzer_meta', JSON.stringify(metaFields)); }, [metaFields]);
+  useEffect(() => { if (videos.length) localStorage.setItem('ytAnalyzer_videos', JSON.stringify(videos)); }, [videos]);
+  useEffect(() => { if (Object.keys(bookBreakdowns).length) localStorage.setItem('ytAnalyzer_breakdowns', JSON.stringify(bookBreakdowns)); }, [bookBreakdowns]);
+  useEffect(() => { if (Object.keys(metaFields).length) localStorage.setItem('ytAnalyzer_meta', JSON.stringify(metaFields)); }, [metaFields]);
   useEffect(() => { localStorage.setItem('ytAnalyzer_speakers', JSON.stringify(speakerProfiles)); }, [speakerProfiles]);
 
   const clearAllData = () => {
     if (!confirm('Clear all saved videos, notes, and speaker profiles?')) return;
-    ['ytAnalyzer_videos','ytAnalyzer_breakdowns','ytAnalyzer_meta','ytAnalyzer_speakers'].forEach(k => localStorage.removeItem(k));
+    ['ytAnalyzer_videos','ytAnalyzer_breakdowns','ytAnalyzer_meta','ytAnalyzer_speakers']
+      .forEach(k => localStorage.removeItem(k));
     setVideos([]); setBookBreakdowns({}); setMetaFields({}); setSpeakerProfiles({});
-    setActiveVideoIndex(0); setUrlsInput(''); setChatOpen(false);
+    setActiveVideoIndex(0); setUrlsInput(''); setChatOpen(false); setActiveTab('research');
   };
 
+  // ── Fetch videos ───────────────────────────────────────────────────────────
   const fetchVideoInfo = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!urlsInput.trim()) return;
-    const urls = urlsInput.split(/[\s,]+/).filter(u => u.trim() !== '');
+    const urls = urlsInput.split(/[\s,]+/).filter(u => u.trim());
     if (!urls.length) return;
-
-    setLoading(true); setError(''); setVideos([]); setActiveVideoIndex(0); setPolishError('');
+    setLoading(true); setError(''); setActiveVideoIndex(0); setPolishError('');
     try {
       const res = await fetch('/api/analyze-bulk', {
         method: 'POST',
@@ -525,11 +118,16 @@ export default function App() {
         body: JSON.stringify({ urls })
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to fetch video information');
-      const successful = data.results.filter((r: any) => r.success);
-      setVideos(successful);
+      if (!res.ok) throw new Error(data.error || 'Failed to fetch');
+      const successful: Video[] = data.results.filter((r: any) => r.success);
+      // Merge with existing, dedup by URL
+      setVideos(prev => {
+        const existing = new Map(prev.map(v => [v.url, v]));
+        successful.forEach(v => existing.set(v.url, v));
+        return Array.from(existing.values());
+      });
       if (data.results.some((r: any) => !r.success)) {
-        setError(`${data.results.filter((r:any)=>!r.success).length} video(s) failed to analyze. Successful ones are shown below.`);
+        setError(`${data.results.filter((r:any)=>!r.success).length} video(s) failed to load.`);
       }
     } catch (err: any) {
       setError(err.message);
@@ -538,118 +136,128 @@ export default function App() {
     }
   };
 
-  const activeVideo = videos[activeVideoIndex];
+  // ── Derived state ──────────────────────────────────────────────────────────
+  const activeVideo   = videos[activeVideoIndex] || null;
   const currentBreakdown = activeVideo ? bookBreakdowns[activeVideo.url] || '' : '';
   const activeVideoId = activeVideo ? getYoutubeId(activeVideo.url) : null;
-  const activeMeta = activeVideo ? metaFields[activeVideo.url] || { date: '', participants: '', tags: '' } : { date: '', participants: '', tags: '' };
+  const activeMeta    = activeVideo ? metaFields[activeVideo.url] || defaultMeta() : defaultMeta();
 
-  const updateMeta = (field: 'date' | 'participants' | 'tags', val: string) => {
+  const updateMeta = (field: keyof VideoMeta, val: string) => {
     if (!activeVideo) return;
-    setMetaFields(prev => ({
-      ...prev,
-      [activeVideo.url]: { ...(prev[activeVideo.url] || { date: '', participants: '', tags: '' }), [field]: val }
-    }));
+    setMetaFields(prev => ({ ...prev, [activeVideo.url]: { ...(prev[activeVideo.url] || defaultMeta()), [field]: val } }));
   };
 
+  // ── Generate breakdown ─────────────────────────────────────────────────────
   const generateBreakdown = async () => {
     if (!activeVideo?.transcript) return;
     setGeneratingBreakdown(true); setPolishError('');
     try {
       const today = new Date().toISOString().split('T')[0];
-      const knownSpeakersText = Object.keys(speakerProfiles).length > 0
+      const knownSpeakersText = Object.keys(speakerProfiles).length
         ? Object.entries(speakerProfiles).map(([n, p]) => profileToPromptString(n, p)).join('\n')
         : 'None yet.';
 
-      const prompt = `You are an expert forensic transcript analyst and diarizer. Your job is to identify every speaker in this transcript as precisely as possible, then produce structured research notes for a book author.
+      const prompt = `You are an expert forensic transcript analyst and diarizer helping a book author reconstruct events from years ago.
 
 === VIDEO CONTEXT ===
 Title: ${activeVideo.title}
 Date of Event: ${activeMeta.date || 'Unknown'}
-Participants hint (user-provided): ${activeMeta.participants || 'None'}
+Participants hint: ${activeMeta.participants || 'None'}
 Tags: ${activeMeta.tags || 'None'}
-Video URL: ${activeVideo.url}
+Chapter/Theme: ${activeMeta.chapter || 'None'}
+URL: ${activeVideo.url}
 
-=== KNOWN SPEAKER DATABASE (learned from previous transcripts) ===
+=== KNOWN SPEAKER DATABASE ===
 ${knownSpeakersText}
 
-=== SPEAKER IDENTIFICATION INSTRUCTIONS ===
-STEP 1 — PRE-MATCH: Before reading the transcript, list which known speakers are LIKELY present based on the title, date, participants hint, and their known topics/roles.
-STEP 2 — ANALYZE: Read the transcript carefully. Match speech segments to known speakers using: name mentions, role references, topic expertise, speech patterns, and aliases.
-STEP 3 — UNKNOWN SPEAKERS: For any speaker you cannot match to a known profile, create a NEW profile. Name them descriptively (e.g. "Unknown Male Host", "Female Questioner") until identified.
-STEP 4 — CONFIDENCE: Mark each speaker assignment as (confirmed) if explicitly named in transcript, or (inferred) if matched by context.
+=== SPEAKER IDENTIFICATION STEPS ===
+STEP 1 — PRE-MATCH: Based on title, date, participants hint, and known topics/roles — which known speakers are likely present?
+STEP 2 — ANALYZE: Read the transcript. Match segments to known speakers via name mentions, role references, topic expertise, speech patterns, aliases.
+STEP 3 — UNKNOWNS: For unmatched speakers, create descriptive names ("Unknown Male Host", "Female Questioner") until identified.
+STEP 4 — CONFIDENCE: Mark each as (confirmed) if named explicitly, or (inferred) if matched by context.
 
-=== REQUIRED MARKDOWN OUTPUT ===
+=== OUTPUT FORMAT (Markdown) ===
 
 ## Speaker Identification
-List each identified speaker, how you identified them, and confidence level.
+Who was identified, how, and confidence.
 
 ## Summary
-Concise summary of what happened.
+Concise summary.
 
 ## Key Themes & Entities
-Bullet points: main topics, people mentioned, locations, facts, key dates.
+Bullet points: topics, people mentioned, locations, facts, key dates.
 
 ## Speaker Breakdown
-For each speaker: what they said, their position/argument/contribution.
+Per speaker: what they said, their position/contribution.
 
 ## Diarized & Polished Transcript
-Full cleaned-up transcript. EVERY paragraph MUST start with **Speaker Name (confidence):** — e.g. **John Doe (confirmed):** or **Unknown Host (inferred):**.
-Fix transcription errors. Keep meaning intact.
+Full cleaned transcript. Every paragraph: **Speaker Name (confirmed/inferred):** 
+Fix transcription errors. Preserve meaning.
+
+=== AFTER MARKDOWN — OUTPUT JSON ===
+\`\`\`json
+{
+  "profiles": [
+    {
+      "fullName": "string",
+      "aliases": ["array"],
+      "role": "string",
+      "topics": ["array"],
+      "speechPatterns": "string",
+      "confidence": "learning|confirmed|verified",
+      "notes": "string"
+    }
+  ]
+}
+\`\`\`
+Include ALL speakers. Merge with existing — do not lose prior data.
 
 === TRANSCRIPT ===
-${activeVideo.transcript}
-
-=== AFTER THE MARKDOWN, OUTPUT THIS JSON BLOCK ===
-Output a JSON block in \`\`\`json ... \`\`\` with the key "profiles" containing an array of speaker profile objects.
-Each object must have these fields (use empty string/array if unknown):
-{
-  "fullName": "string — best known name",
-  "aliases": ["array of alternate names/nicknames seen in this or past transcripts"],
-  "role": "string — journalist | lawyer | defendant | witness | host | etc.",
-  "topics": ["array of subjects they commonly discuss"],
-  "speechPatterns": "string — distinctive vocabulary, phrases, cadence, accent notes",
-  "confidence": "learning | confirmed | verified",
-  "notes": "string — any extra context useful for future identification"
-}
-Include ALL speakers found in this transcript. For existing known speakers, MERGE and UPDATE their data — do not lose previous information.`;
+${activeVideo.transcript}`;
 
       const response = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
+      if (!response.text) throw new Error('No response from Gemini.');
 
-      if (response.text) {
-        let textResult = response.text;
-        const jsonMatch = textResult.match(/```json\n([\s\S]*?)\n```/);
-        if (jsonMatch?.[1]) {
-          try {
-            const parsed = JSON.parse(jsonMatch[1]);
-            const profilesArray: any[] = parsed.profiles || (Array.isArray(parsed) ? parsed : []);
-            setSpeakerProfiles(prev => {
-              const updated = { ...prev };
-              for (const p of profilesArray) {
-                const name = p.fullName || p.name || 'Unknown';
-                const existing = updated[name];
-                updated[name] = {
-                  fullName: name,
-                  aliases: [...new Set([...(existing?.aliases || []), ...(p.aliases || [])])],
-                  role: p.role || existing?.role || '',
-                  topics: [...new Set([...(existing?.topics || []), ...(p.topics || [])])],
-                  speechPatterns: p.speechPatterns || existing?.speechPatterns || '',
-                  firstSeen: existing?.firstSeen || today,
-                  lastSeen: today,
-                  appearances: (existing?.appearances || 0) + 1,
-                  confidence: p.confidence || existing?.confidence || 'learning',
-                  notes: [existing?.notes, p.notes].filter(Boolean).join(' | ') || '',
-                };
-              }
-              return updated;
-            });
-            textResult = textResult.replace(/```json\n[\s\S]*?\n```/, '').trim();
-          } catch (e) { console.error('Failed to parse speaker profiles', e); }
-        }
-        const finalBreakdown = `**Reference URL:** ${activeVideo.url}\n**Event Date:** ${activeMeta.date || 'Not specified'}\n**Participants:** ${activeMeta.participants || 'Not specified'}\n\n---\n\n${textResult}`;
-        setBookBreakdowns(prev => ({ ...prev, [activeVideo.url]: finalBreakdown }));
-      } else {
-        throw new Error('No text returned from Gemini API.');
+      let textResult = response.text;
+      const jsonMatch = textResult.match(/```json\n([\s\S]*?)\n```/);
+      if (jsonMatch?.[1]) {
+        try {
+          const parsed = JSON.parse(jsonMatch[1]);
+          const profilesArray: any[] = parsed.profiles || (Array.isArray(parsed) ? parsed : []);
+          setSpeakerProfiles(prev => {
+            const updated = { ...prev };
+            for (const p of profilesArray) {
+              const name = p.fullName || p.name || 'Unknown';
+              const ex = updated[name];
+              updated[name] = {
+                fullName: name,
+                aliases: [...new Set([...(ex?.aliases || []), ...(p.aliases || [])])],
+                role: p.role || ex?.role || '',
+                topics: [...new Set([...(ex?.topics || []), ...(p.topics || [])])],
+                speechPatterns: p.speechPatterns || ex?.speechPatterns || '',
+                firstSeen: ex?.firstSeen || today,
+                lastSeen: today,
+                appearances: (ex?.appearances || 0) + 1,
+                confidence: p.confidence || ex?.confidence || 'learning',
+                notes: [ex?.notes, p.notes].filter(Boolean).join(' | ') || '',
+              };
+            }
+            return updated;
+          });
+          textResult = textResult.replace(/```json\n[\s\S]*?\n```/, '').trim();
+        } catch (e) { console.error('Speaker profile parse error', e); }
       }
+
+      const meta = activeMeta;
+      const header = [
+        `**URL:** ${activeVideo.url}`,
+        `**Date:** ${meta.date || 'Not specified'}`,
+        `**Participants:** ${meta.participants || 'Not specified'}`,
+        meta.chapter ? `**Chapter:** ${meta.chapter}` : null,
+        meta.tags ? `**Tags:** ${meta.tags}` : null,
+      ].filter(Boolean).join('\n');
+
+      setBookBreakdowns(prev => ({ ...prev, [activeVideo.url]: `${header}\n\n---\n\n${textResult}` }));
     } catch (err: any) {
       setPolishError(err.message || 'Error generating breakdown');
     } finally {
@@ -659,25 +267,25 @@ Include ALL speakers found in this transcript. For existing known speakers, MERG
 
   const handleCopy = () => {
     navigator.clipboard.writeText(currentBreakdown);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setCopied(true); setTimeout(() => setCopied(false), 2000);
   };
 
+  // ── Export ─────────────────────────────────────────────────────────────────
   const exportAllData = () => {
     if (!videos.length) return;
-    let out = `# Book Research: Video Transcripts and Notes\n\n*Generated: ${new Date().toLocaleDateString()}*\n\n---\n\n`;
+    let out = `# Book Research Export\n\nGenerated: ${new Date().toLocaleDateString()}\n\n---\n\n`;
     videos.forEach(v => {
-      out += `## ${v.title || v.url}\n- **URL:** ${v.url}\n`;
-      const meta = metaFields[v.url];
-      if (meta) { out += `- **Date:** ${meta.date||'N/A'}\n- **Participants:** ${meta.participants||'N/A'}\n- **Tags:** ${meta.tags||'N/A'}\n`; }
+      const m = metaFields[v.url] || defaultMeta();
+      out += `## ${v.title || v.url}\n- **URL:** ${v.url}\n- **Date:** ${m.date||'N/A'}\n- **Participants:** ${m.participants||'N/A'}\n`;
+      if (m.chapter) out += `- **Chapter:** ${m.chapter}\n`;
+      if (m.tags) out += `- **Tags:** ${m.tags}\n`;
       out += `\n### Notes\n\n${bookBreakdowns[v.url] || '*No notes yet.*'}\n\n---\n\n`;
     });
-    if (Object.keys(speakerProfiles).length > 0) {
-      out += `## Speaker Profiles Registry\n\n`;
-      Object.entries(speakerProfiles).forEach(([n, p]: [string, any]) => {
+    if (Object.keys(speakerProfiles).length) {
+      out += `## Speaker Registry\n\n`;
+      Object.entries(speakerProfiles).forEach(([n, p]) => {
         out += `### ${n}\n`;
-        out += `- **Role:** ${p.role || 'Unknown'}\n`;
-        out += `- **Confidence:** ${p.confidence || 'learning'} | **Appearances:** ${p.appearances || 0}\n`;
+        out += `- **Role:** ${p.role||'Unknown'} | **Confidence:** ${p.confidence} | **Appearances:** ${p.appearances}\n`;
         if (p.aliases?.length) out += `- **Aliases:** ${p.aliases.join(', ')}\n`;
         if (p.topics?.length) out += `- **Topics:** ${p.topics.join(', ')}\n`;
         if (p.speechPatterns) out += `- **Speech patterns:** ${p.speechPatterns}\n`;
@@ -691,35 +299,26 @@ Include ALL speakers found in this transcript. For existing known speakers, MERG
     document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
   };
 
+  // ── Speaker CRUD ───────────────────────────────────────────────────────────
   const addSpeaker = () => {
     if (!newSpeakerName.trim()) return;
     const today = new Date().toISOString().split('T')[0];
     const name = newSpeakerName.trim();
     setSpeakerProfiles(prev => ({
       ...prev,
-      [name]: {
-        fullName: name,
-        aliases: [],
-        role: '',
-        topics: [],
-        speechPatterns: newSpeakerDesc.trim(),
-        firstSeen: today,
-        lastSeen: today,
-        appearances: 0,
-        confidence: 'learning',
-        notes: newSpeakerDesc.trim(),
-      }
+      [name]: { fullName: name, aliases: [], role: '', topics: [], speechPatterns: newSpeakerDesc.trim(),
+        firstSeen: today, lastSeen: today, appearances: 0, confidence: 'learning', notes: newSpeakerDesc.trim() }
     }));
     setNewSpeakerName(''); setNewSpeakerDesc(''); setAddingSpeaker(false);
   };
 
-  const updateSpeaker = (oldName: string, newName: string, updatedProfile: Partial<SpeakerProfile>) => {
+  const updateSpeaker = (oldName: string, newName: string, updated: Partial<SpeakerProfile>) => {
     setSpeakerProfiles(prev => {
-      const updated = { ...prev };
-      const existing = updated[oldName] || {} as SpeakerProfile;
-      if (oldName !== newName) delete updated[oldName];
-      updated[newName] = { ...existing, ...updatedProfile, fullName: newName };
-      return updated;
+      const u = { ...prev };
+      const ex = u[oldName] || {} as SpeakerProfile;
+      if (oldName !== newName) delete u[oldName];
+      u[newName] = { ...ex, ...updated, fullName: newName };
+      return u;
     });
   };
 
@@ -727,39 +326,176 @@ Include ALL speakers found in this transcript. For existing known speakers, MERG
     setSpeakerProfiles(prev => { const u = { ...prev }; delete u[name]; return u; });
   };
 
-  const transcriptWordCount = activeVideo ? wordCount(activeVideo.transcript) : 0;
-  const transcriptReadTime = activeVideo ? readTime(activeVideo.transcript) : 0;
+  const txWords = activeVideo ? wordCount(activeVideo.transcript) : 0;
+  const txTime  = activeVideo ? readTime(activeVideo.transcript) : 0;
+
+  // ── Sidebar: shared for research tab ──────────────────────────────────────
+  const Sidebar = (
+    <aside className="w-72 xl:w-80 bg-white border-r border-slate-200 flex flex-col overflow-hidden shrink-0 hidden md:flex">
+      {/* Video list */}
+      {videos.length > 1 && (
+        <div className="p-3 border-b border-slate-100 bg-slate-50">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">{videos.length} Videos</p>
+          <div className="space-y-1 max-h-36 overflow-y-auto">
+            {videos.map((v, i) => (
+              <button key={i} onClick={() => { setActiveVideoIndex(i); setActiveTab('research'); }}
+                className={`text-left w-full px-2.5 py-1.5 rounded-lg text-xs font-medium truncate transition-colors ${i === activeVideoIndex ? 'bg-blue-600 text-white' : 'hover:bg-slate-200 text-slate-600'}`}>
+                {v.title || v.url}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="overflow-y-auto flex-1 p-4 space-y-5">
+        {/* Thumbnail */}
+        <div>
+          {activeVideoId && (
+            <div className="w-full aspect-video bg-slate-900 rounded-xl overflow-hidden mb-3 shadow-sm border border-slate-200">
+              <iframe width="100%" height="100%" src={`https://www.youtube.com/embed/${activeVideoId}`}
+                title="YouTube video" frameBorder="0"
+                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                allowFullScreen />
+            </div>
+          )}
+          {activeVideo && (
+            <>
+              <h1 className="text-sm font-bold leading-snug mb-1">{activeVideo.title}</h1>
+              <a href={activeVideo.url} target="_blank" rel="noreferrer" className="text-[10px] text-blue-500 hover:underline flex items-center gap-1 truncate">
+                <ExternalLink className="w-3 h-3 shrink-0" />{activeVideo.url}
+              </a>
+            </>
+          )}
+        </div>
+
+        {/* Stats */}
+        {txWords > 0 && (
+          <div className="grid grid-cols-2 gap-2">
+            <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 text-center">
+              <p className="text-base font-extrabold text-slate-800">{txWords.toLocaleString()}</p>
+              <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Words</p>
+            </div>
+            <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 text-center">
+              <p className="text-base font-extrabold text-slate-800">{txTime} min</p>
+              <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Read Time</p>
+            </div>
+          </div>
+        )}
+
+        {/* Description */}
+        {activeVideo?.description && (
+          <div>
+            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Description</p>
+            <p className="text-xs text-slate-500 leading-relaxed line-clamp-4">{activeVideo.description}</p>
+          </div>
+        )}
+
+        {/* Metadata */}
+        <div className="space-y-3 pt-4 border-t border-slate-100">
+          <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+            <BarChart2 className="w-3 h-3" /> Research Metadata
+          </p>
+          <div className="space-y-1">
+            <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><Calendar className="w-3 h-3" /> Event Date</label>
+            <QuickDatePicker value={activeMeta.date} onChange={v => updateMeta('date', v)} />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><Users className="w-3 h-3" /> Participants</label>
+            <textarea value={activeMeta.participants} onChange={e => updateMeta('participants', e.target.value)}
+              placeholder="Who is in this video?" rows={2}
+              className="w-full text-xs p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none resize-none placeholder:text-slate-300" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><BookOpen className="w-3 h-3" /> Chapter / Theme</label>
+            <input type="text" value={activeMeta.chapter} onChange={e => updateMeta('chapter', e.target.value)}
+              placeholder="e.g. Chapter 3 - The Cover-Up"
+              className="w-full text-xs p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none placeholder:text-slate-300" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><Tag className="w-3 h-3" /> Tags</label>
+            <input type="text" value={activeMeta.tags} onChange={e => updateMeta('tags', e.target.value)}
+              placeholder="e.g. interview, 2020, court"
+              className="w-full text-xs p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none placeholder:text-slate-300" />
+          </div>
+          <div className="space-y-1">
+            <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><FileText className="w-3 h-3" /> Your Notes</label>
+            <textarea value={activeMeta.notes} onChange={e => updateMeta('notes', e.target.value)}
+              placeholder="Your own annotations, questions, reminders..." rows={3}
+              className="w-full text-xs p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none resize-none placeholder:text-slate-300" />
+          </div>
+        </div>
+
+        {/* Speaker profiles */}
+        <div className="pt-4 border-t border-slate-100 space-y-2">
+          <div className="flex items-center justify-between">
+            <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+              <User className="w-3 h-3" /> Learned Voices
+              {Object.keys(speakerProfiles).length > 0 && (
+                <span className="bg-blue-100 text-blue-700 font-bold px-1.5 py-0.5 rounded text-[9px]">
+                  {Object.keys(speakerProfiles).length}
+                </span>
+              )}
+            </p>
+            <button onClick={() => setAddingSpeaker(a => !a)}
+              className="p-1 hover:bg-blue-50 rounded-lg text-slate-400 hover:text-blue-600 transition-colors" title="Add speaker">
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {addingSpeaker && (
+            <div className="bg-blue-50 border border-blue-200 rounded-xl p-2.5 space-y-2">
+              <input value={newSpeakerName} onChange={e => setNewSpeakerName(e.target.value)}
+                placeholder="Speaker name"
+                className="w-full text-xs p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400 bg-white" />
+              <textarea value={newSpeakerDesc} onChange={e => setNewSpeakerDesc(e.target.value)}
+                placeholder="Role, speech patterns, topics..." rows={2}
+                className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400 bg-white" />
+              <div className="flex gap-1.5">
+                <button onClick={addSpeaker} className="flex-1 text-[11px] font-bold bg-blue-600 text-white py-1 rounded-lg hover:bg-blue-700">Add</button>
+                <button onClick={() => setAddingSpeaker(false)} className="px-2 text-[11px] bg-white text-slate-600 rounded-lg border border-slate-200">Cancel</button>
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-1.5 max-h-72 overflow-y-auto pr-0.5">
+            {Object.keys(speakerProfiles).length === 0 && !addingSpeaker && (
+              <p className="text-[11px] text-slate-400 italic text-center py-3">No voices learned yet.</p>
+            )}
+            {Object.entries(speakerProfiles).map(([name, profile]) => (
+              <SpeakerCard key={name} name={name} profile={profile}
+                onUpdate={(n, u) => updateSpeaker(name, n, u)}
+                onDelete={() => deleteSpeaker(name)} />
+            ))}
+          </div>
+        </div>
+      </div>
+    </aside>
+  );
 
   return (
     <div className="h-screen bg-slate-100 flex flex-col font-sans text-slate-900 overflow-hidden">
 
-      {/* ── Header ─────────────────────────────────────────────────────── */}
-      <header className="h-16 bg-white border-b border-slate-200 px-4 md:px-6 flex items-center gap-4 shrink-0 shadow-sm">
+      {/* ── Header ─────────────────────────────────────────────────── */}
+      <header className="h-14 bg-white border-b border-slate-200 px-4 md:px-6 flex items-center gap-4 shrink-0 shadow-sm">
         <div className="flex items-center gap-2.5 shrink-0">
-          <div className="w-8 h-8 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-lg flex items-center justify-center shadow-sm">
+          <div className="w-7 h-7 bg-gradient-to-br from-blue-600 to-indigo-600 rounded-lg flex items-center justify-center shadow-sm">
             <Youtube className="w-4 h-4 text-white" />
           </div>
-          <span className="font-extrabold text-lg tracking-tight hidden md:inline">
+          <span className="font-extrabold text-base tracking-tight hidden md:inline">
             Transcriber<span className="text-blue-600">AI</span>
           </span>
         </div>
 
         <form onSubmit={fetchVideoInfo} className="flex-1 flex items-center gap-2 max-w-3xl">
           <div className="relative flex-1">
-            <Youtube className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              value={urlsInput}
-              onChange={e => setUrlsInput(e.target.value)}
-              placeholder="Paste YouTube URL(s) — separate with space or comma..."
-              className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-9 pr-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-300 transition-all"
-            />
+            <Youtube className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input value={urlsInput} onChange={e => setUrlsInput(e.target.value)}
+              placeholder="Paste YouTube URL(s) — space or comma separated..."
+              className="w-full bg-slate-50 border border-slate-200 rounded-xl pl-8 pr-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-300 transition-all" />
           </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2 rounded-xl text-sm font-semibold flex items-center gap-2 disabled:opacity-50 transition-colors shadow-sm whitespace-nowrap"
-          >
-            {loading ? <Loader2 className="animate-spin w-4 h-4" /> : <Zap className="w-4 h-4" />}
+          <button type="submit" disabled={loading}
+            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-xl text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50 transition-colors shadow-sm whitespace-nowrap">
+            {loading ? <Loader2 className="animate-spin w-3.5 h-3.5" /> : <Zap className="w-3.5 h-3.5" />}
             {loading ? 'Analyzing...' : 'Analyze'}
           </button>
         </form>
@@ -775,318 +511,213 @@ Include ALL speakers found in this transcript. For existing known speakers, MERG
               </button>
             </>
           )}
-          <button
-            onClick={() => setChatOpen(o => !o)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${chatOpen ? 'bg-blue-600 text-white shadow-sm' : 'bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700'}`}
-          >
+          <button onClick={() => setChatOpen(o => !o)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${chatOpen ? 'bg-blue-600 text-white' : 'bg-slate-100 hover:bg-blue-50 text-slate-700 hover:text-blue-700'}`}>
             <MessageSquare className="w-3.5 h-3.5" />
             <span className="hidden sm:inline">AI Chat</span>
           </button>
         </div>
       </header>
 
-      {/* ── Body ───────────────────────────────────────────────────────── */}
-      <div className="flex-1 flex overflow-hidden">
+      {/* ── Tab Bar ────────────────────────────────────────────────── */}
+      <div className="bg-white border-b border-slate-200 px-6 flex items-center gap-1 shrink-0">
+        {TABS.map(tab => {
+          const Icon = tab.icon;
+          const disabled = tab.requiresVideos && videos.length === 0;
+          return (
+            <button key={tab.id}
+              onClick={() => !disabled && setActiveTab(tab.id)}
+              disabled={disabled}
+              className={`flex items-center gap-1.5 px-3 py-2.5 text-xs font-semibold border-b-2 transition-all whitespace-nowrap ${
+                activeTab === tab.id
+                  ? 'border-blue-600 text-blue-600'
+                  : disabled
+                    ? 'border-transparent text-slate-300 cursor-not-allowed'
+                    : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'
+              }`}>
+              <Icon className="w-3.5 h-3.5" />
+              {tab.label}
+            </button>
+          );
+        })}
+        {videos.length > 0 && (
+          <span className="ml-auto text-[10px] text-slate-400 font-medium pb-1">
+            {videos.length} video{videos.length !== 1 ? 's' : ''} · {Object.keys(speakerProfiles).length} speaker{Object.keys(speakerProfiles).length !== 1 ? 's' : ''}
+          </span>
+        )}
+      </div>
 
-        {/* ── Main area ───────────────────────────────────────────────── */}
+      {/* ── Body ───────────────────────────────────────────────────── */}
+      <div className="flex-1 flex overflow-hidden">
         <div className="flex-1 flex overflow-hidden">
 
-          {/* Error state / empty state */}
-          {error && videos.length === 0 ? (
-            <div className="flex-1 flex items-center justify-center p-6">
-              <div className="bg-red-50 text-red-800 p-4 rounded-xl flex items-start gap-3 border border-red-200 max-w-lg shadow-sm">
-                <AlertCircle className="w-5 h-5 mt-0.5 shrink-0" />
-                <p className="text-sm font-medium">{error}</p>
-              </div>
-            </div>
-          ) : videos.length > 0 ? (
+          {/* ── RESEARCH TAB ─────────────────────────────────────── */}
+          {activeTab === 'research' && (
             <>
-              {/* ── Left Sidebar ──────────────────────────────────────── */}
-              <aside className="w-72 xl:w-80 bg-white border-r border-slate-200 flex flex-col overflow-hidden shrink-0 hidden md:flex">
-                {/* Video list */}
-                {videos.length > 1 && (
-                  <div className="p-3 border-b border-slate-100 bg-slate-50">
-                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-2">{videos.length} Videos Loaded</p>
-                    <div className="space-y-1 max-h-28 overflow-y-auto">
-                      {videos.map((v, i) => (
-                        <button
-                          key={i}
-                          onClick={() => setActiveVideoIndex(i)}
-                          className={`text-left w-full px-2.5 py-1.5 rounded-lg text-xs font-medium truncate transition-colors ${i === activeVideoIndex ? 'bg-blue-600 text-white' : 'hover:bg-slate-200 text-slate-600'}`}
-                        >
-                          {v.title || v.url}
-                        </button>
-                      ))}
-                    </div>
+              {error && videos.length === 0 ? (
+                <div className="flex-1 flex items-center justify-center p-6">
+                  <div className="bg-red-50 text-red-800 p-4 rounded-xl flex items-start gap-3 border border-red-200 max-w-lg shadow-sm">
+                    <AlertCircle className="w-5 h-5 mt-0.5 shrink-0" />
+                    <p className="text-sm font-medium">{error}</p>
                   </div>
-                )}
-
-                <div className="overflow-y-auto flex-1 p-4 space-y-5">
-                  {/* Thumbnail + title */}
-                  <div>
-                    {activeVideoId && (
-                      <div className="w-full aspect-video bg-slate-900 rounded-xl overflow-hidden mb-3 shadow-sm border border-slate-200">
-                        <iframe width="100%" height="100%" src={`https://www.youtube.com/embed/${activeVideoId}`}
-                          title="YouTube video" frameBorder="0"
-                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                          allowFullScreen />
+                </div>
+              ) : videos.length > 0 ? (
+                <>
+                  {Sidebar}
+                  <section className="flex-1 flex flex-col overflow-hidden bg-slate-50">
+                    {/* Toolbar */}
+                    <div className="px-4 py-2.5 bg-white border-b border-slate-200 flex items-center gap-3 shrink-0">
+                      {error && (
+                        <div className="flex items-center gap-1.5 text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-lg text-xs font-medium">
+                          <AlertCircle className="w-3.5 h-3.5" />{error}
+                        </div>
+                      )}
+                      <div className="relative flex-1 max-w-xs">
+                        <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                          placeholder="Search transcript & notes..."
+                          className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/20" />
                       </div>
-                    )}
-                    <h1 className="text-sm font-bold leading-snug mb-1">{activeVideo?.title}</h1>
-                    <a href={activeVideo?.url} target="_blank" rel="noreferrer" className="text-[10px] text-blue-500 hover:underline flex items-center gap-1 truncate">
-                      <ExternalLink className="w-3 h-3 shrink-0" />{activeVideo?.url}
-                    </a>
-                  </div>
-
-                  {/* Stats bar */}
-                  {activeVideo?.transcript && (
-                    <div className="grid grid-cols-2 gap-2">
-                      <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 text-center">
-                        <p className="text-base font-extrabold text-slate-800">{transcriptWordCount.toLocaleString()}</p>
-                        <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Words</p>
-                      </div>
-                      <div className="bg-slate-50 border border-slate-100 rounded-lg p-2 text-center">
-                        <p className="text-base font-extrabold text-slate-800">{transcriptReadTime} min</p>
-                        <p className="text-[9px] uppercase tracking-wider text-slate-400 font-bold">Read Time</p>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Description */}
-                  {activeVideo?.description && (
-                    <div>
-                      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5">Description</p>
-                      <p className="text-xs text-slate-500 leading-relaxed line-clamp-4">{activeVideo.description}</p>
-                    </div>
-                  )}
-
-                  {/* Metadata */}
-                  <div className="space-y-3 pt-4 border-t border-slate-100">
-                    <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5"><BarChart2 className="w-3 h-3" />Research Metadata</p>
-
-                    {/* Date with quick picker */}
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><Calendar className="w-3 h-3" /> Event Date</label>
-                      <QuickDatePicker value={activeMeta.date} onChange={v => updateMeta('date', v)} />
-                    </div>
-
-                    {/* Participants */}
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><Users className="w-3 h-3" /> Participants</label>
-                      <textarea
-                        value={activeMeta.participants}
-                        onChange={e => updateMeta('participants', e.target.value)}
-                        placeholder="Who is in this video?"
-                        className="w-full text-xs p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none resize-none min-h-[60px] placeholder:text-slate-300 transition-shadow"
-                      />
-                    </div>
-
-                    {/* Tags */}
-                    <div className="space-y-1">
-                      <label className="text-[10px] font-semibold text-slate-500 flex items-center gap-1"><Tag className="w-3 h-3" /> Tags</label>
-                      <input
-                        type="text"
-                        value={activeMeta.tags}
-                        onChange={e => updateMeta('tags', e.target.value)}
-                        placeholder="e.g. interview, 2023, court case"
-                        className="w-full text-xs p-2 bg-white border border-slate-200 rounded-lg focus:ring-2 focus:ring-blue-500 outline-none placeholder:text-slate-300 transition-shadow"
-                      />
-                    </div>
-                  </div>
-
-                  {/* Speaker Profiles */}
-                  <div className="pt-4 border-t border-slate-100 space-y-2">
-                    <div className="flex items-center justify-between">
-                      <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-                        <User className="w-3 h-3" /> Learned Voices
-                        {Object.keys(speakerProfiles).length > 0 && (
-                          <span className="bg-blue-100 text-blue-700 font-bold px-1.5 py-0.5 rounded text-[9px]">{Object.keys(speakerProfiles).length}</span>
+                      <div className="ml-auto flex items-center gap-2">
+                        {currentBreakdown && (
+                          <button onClick={() => setBookBreakdowns(prev => { const u = {...prev}; if (activeVideo) delete u[activeVideo.url]; return u; })}
+                            className="text-xs text-slate-400 hover:text-red-600 px-2 py-1.5 rounded-lg hover:bg-red-50 transition-colors">
+                            Regenerate
+                          </button>
                         )}
-                      </p>
-                      <button
-                        onClick={() => setAddingSpeaker(a => !a)}
-                        className="p-1 hover:bg-blue-50 rounded-lg text-slate-400 hover:text-blue-600 transition-colors"
-                        title="Add speaker"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                      </button>
+                        <button onClick={generateBreakdown}
+                          disabled={generatingBreakdown || !!currentBreakdown}
+                          className="flex items-center gap-2 px-4 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-semibold hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm">
+                          {generatingBreakdown ? <Loader2 className="animate-spin w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5" />}
+                          {generatingBreakdown ? 'Generating...' : currentBreakdown ? '✓ Notes Ready' : 'Generate Notes'}
+                        </button>
+                      </div>
                     </div>
 
-                    {addingSpeaker && (
-                      <div className="bg-blue-50 border border-blue-200 rounded-xl p-2.5 space-y-2">
-                        <input
-                          value={newSpeakerName}
-                          onChange={e => setNewSpeakerName(e.target.value)}
-                          placeholder="Speaker name"
-                          className="w-full text-xs p-1.5 border border-slate-200 rounded-lg outline-none focus:ring-2 focus:ring-blue-400 bg-white"
-                        />
-                        <textarea
-                          value={newSpeakerDesc}
-                          onChange={e => setNewSpeakerDesc(e.target.value)}
-                          placeholder="Role, speech patterns, topics..."
-                          className="w-full text-[11px] p-1.5 border border-slate-200 rounded-lg outline-none resize-none focus:ring-2 focus:ring-blue-400 bg-white"
-                          rows={2}
-                        />
-                        <div className="flex gap-1.5">
-                          <button onClick={addSpeaker} className="flex-1 text-[11px] font-bold bg-blue-600 text-white py-1 rounded-lg hover:bg-blue-700 transition-colors">Add</button>
-                          <button onClick={() => setAddingSpeaker(false)} className="px-2 text-[11px] bg-white text-slate-600 rounded-lg border border-slate-200 hover:bg-slate-50 transition-colors">Cancel</button>
-                        </div>
+                    {polishError && (
+                      <div className="mx-4 mt-3 bg-red-50 text-red-800 p-3 rounded-xl text-xs border border-red-200 flex items-start gap-2 shrink-0">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /><span>{polishError}</span>
                       </div>
                     )}
 
-                    <div className="space-y-1.5 max-h-64 overflow-y-auto pr-0.5">
-                      {Object.keys(speakerProfiles).length === 0 && !addingSpeaker && (
-                        <p className="text-[11px] text-slate-400 italic text-center py-3">No voices learned yet. Generate a breakdown or add one manually.</p>
+                    {/* Panels */}
+                    <div className="flex-1 flex gap-4 p-4 overflow-hidden min-h-0">
+                      {/* Transcript */}
+                      <div className={`flex-1 bg-white border border-slate-200 rounded-2xl flex flex-col overflow-hidden shadow-sm ${currentBreakdown ? 'hidden lg:flex' : ''}`}>
+                        <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between shrink-0">
+                          <div className="flex items-center gap-2">
+                            <FileText className="w-3.5 h-3.5 text-slate-400" />
+                            <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Source Transcript</span>
+                          </div>
+                          {txWords > 0 && <span className="text-[10px] text-slate-400">{txWords.toLocaleString()} words · ~{txTime} min</span>}
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-5">
+                          <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                            {highlightText(activeVideo?.transcript || 'No transcript available.', searchQuery)}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Notes */}
+                      {currentBreakdown && (
+                        <div className="flex-1 bg-white border border-blue-100 rounded-2xl flex flex-col overflow-hidden shadow-[0_4px_24px_rgba(37,99,235,0.08)]">
+                          <div className="px-5 py-3 border-b border-blue-100 flex items-center justify-between shrink-0 bg-gradient-to-r from-blue-50 to-indigo-50">
+                            <div className="flex items-center gap-2">
+                              <Sparkles className="w-3.5 h-3.5 text-blue-500" />
+                              <span className="text-xs font-bold uppercase tracking-wider text-blue-700">Book Notes & Analysis</span>
+                            </div>
+                            <button onClick={handleCopy} className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-blue-700 bg-white border border-slate-200 hover:border-blue-300 px-2.5 py-1 rounded-lg transition-all shadow-sm">
+                              {copied ? <CheckCircle className="w-3 h-3 text-green-600" /> : <Copy className="w-3 h-3" />}
+                              {copied ? 'Copied!' : 'Copy'}
+                            </button>
+                          </div>
+                          <div className="flex-1 overflow-y-auto p-5">
+                            <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-headings:font-bold prose-a:text-blue-600 prose-strong:text-slate-800">
+                              <Markdown components={{
+                                p: ({node,...props}) => <p>{highlightChildren(props.children, searchQuery)}</p>,
+                                li: ({node,...props}) => <li>{highlightChildren(props.children, searchQuery)}</li>,
+                                h1: ({node,...props}) => <h1>{highlightChildren(props.children, searchQuery)}</h1>,
+                                h2: ({node,...props}) => <h2>{highlightChildren(props.children, searchQuery)}</h2>,
+                                h3: ({node,...props}) => <h3>{highlightChildren(props.children, searchQuery)}</h3>,
+                                strong: ({node,...props}) => <strong>{highlightChildren(props.children, searchQuery)}</strong>,
+                              }}>
+                                {currentBreakdown}
+                              </Markdown>
+                            </div>
+                          </div>
+                        </div>
                       )}
-                      {Object.entries(speakerProfiles).map(([name, profile]) => (
-                        <SpeakerCard
-                          key={name} name={name} profile={profile as SpeakerProfile}
-                          onUpdate={(n, updated) => updateSpeaker(name, n, updated)}
-                          onDelete={() => deleteSpeaker(name)}
-                        />
+                    </div>
+                  </section>
+                </>
+              ) : (
+                // ── Landing ────────────────────────────────────────
+                <div className="flex-1 overflow-y-auto bg-gradient-to-br from-slate-50 to-blue-50/30">
+                  <div className="max-w-5xl mx-auto px-6 py-14 flex flex-col items-center">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-100 text-blue-700 font-bold text-xs mb-7 border border-blue-200 uppercase tracking-wider">
+                      <Zap className="w-3.5 h-3.5" /> Book Research Assistant
+                    </div>
+                    <h1 className="text-4xl md:text-5xl font-extrabold text-slate-900 tracking-tight text-center mb-5 leading-tight">
+                      Reconstruct Events.<br />
+                      <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600">Write the Book.</span>
+                    </h1>
+                    <p className="text-lg text-slate-500 text-center max-w-2xl mb-12 leading-relaxed">
+                      Analyze YouTube videos from years ago — extract transcripts, identify speakers, find contradictions, pull quotes, and build a chronological timeline. Everything you need for investigative non-fiction.
+                    </p>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 w-full max-w-4xl">
+                      {[
+                        { icon: AlignLeft, color: 'blue', title: 'Research & Transcripts', desc: 'Extract full transcripts and let Gemini generate structured research notes with speaker diarization.' },
+                        { icon: Clock, color: 'indigo', title: 'Event Timeline', desc: 'Automatically sort all videos by event date into a visual chronological timeline.' },
+                        { icon: Search, color: 'violet', title: 'Cross-Video Search', desc: 'Search any name, place, or phrase across all transcripts and notes at once.' },
+                        { icon: GitCompare, color: 'amber', title: 'Contradiction Detector', desc: 'Compare two videos and let AI flag where accounts diverge or contradict.' },
+                        { icon: Quote, color: 'emerald', title: 'Quote Extractor', desc: 'Pull citation-ready quotes by speaker or topic across any or all videos.' },
+                        { icon: Users, color: 'rose', title: 'Speaker Learning', desc: 'AI builds speaker profiles across transcripts — the more you process, the smarter it gets.' },
+                      ].map(({ icon: Icon, color, title, desc }) => (
+                        <div key={title} className={`bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-start gap-4 hover:shadow-md transition-shadow group`}>
+                          <div className={`w-10 h-10 bg-${color}-50 rounded-xl flex items-center justify-center shrink-0 border border-${color}-100 group-hover:scale-105 transition-transform`}>
+                            <Icon className={`w-5 h-5 text-${color}-600`} />
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-slate-900 text-sm mb-1">{title}</h3>
+                            <p className="text-xs text-slate-500 leading-relaxed">{desc}</p>
+                          </div>
+                        </div>
                       ))}
                     </div>
                   </div>
                 </div>
-              </aside>
-
-              {/* ── Main Content ─────────────────────────────────────── */}
-              <section className="flex-1 flex flex-col overflow-hidden bg-slate-50">
-                {/* Toolbar */}
-                <div className="px-4 py-3 bg-white border-b border-slate-200 flex items-center gap-3 shrink-0">
-                  {error && (
-                    <div className="flex items-center gap-1.5 text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-1 rounded-lg text-xs font-medium">
-                      <AlertCircle className="w-3.5 h-3.5" />{error}
-                    </div>
-                  )}
-                  <div className="relative flex-1 max-w-xs">
-                    <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" />
-                    <input
-                      type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
-                      placeholder="Search transcript & notes..."
-                      className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/20 transition-all"
-                    />
-                  </div>
-                  <div className="ml-auto flex items-center gap-2">
-                    <button
-                      onClick={generateBreakdown}
-                      disabled={generatingBreakdown || !!currentBreakdown}
-                      className="flex items-center gap-2 px-4 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-semibold hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors shadow-sm"
-                    >
-                      {generatingBreakdown ? <Loader2 className="animate-spin w-3.5 h-3.5" /> : <Sparkles className="w-3.5 h-3.5" />}
-                      {generatingBreakdown ? 'Generating...' : currentBreakdown ? '✓ Notes Ready' : 'Generate Notes'}
-                    </button>
-                  </div>
-                </div>
-
-                {polishError && (
-                  <div className="mx-4 mt-3 bg-red-50 text-red-800 p-3 rounded-xl text-xs border border-red-200 flex items-start gap-2 shrink-0">
-                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                    <span>{polishError}</span>
-                  </div>
-                )}
-
-                {/* Transcript / Breakdown area */}
-                <div className="flex-1 flex gap-4 p-4 overflow-hidden min-h-0">
-                  {/* Raw Transcript */}
-                  <div className={`flex-1 bg-white border border-slate-200 rounded-2xl flex flex-col overflow-hidden shadow-sm ${currentBreakdown ? 'hidden lg:flex' : ''}`}>
-                    <div className="px-5 py-3 border-b border-slate-100 flex items-center justify-between shrink-0">
-                      <div className="flex items-center gap-2">
-                        <FileText className="w-3.5 h-3.5 text-slate-400" />
-                        <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Source Transcript</span>
-                      </div>
-                      {transcriptWordCount > 0 && (
-                        <span className="text-[10px] text-slate-400 font-medium">{transcriptWordCount.toLocaleString()} words · ~{transcriptReadTime} min read</span>
-                      )}
-                    </div>
-                    <div className="flex-1 overflow-y-auto p-5">
-                      <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
-                        {highlightText(activeVideo?.transcript || 'No transcript available.', searchQuery)}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Book Breakdown */}
-                  {currentBreakdown && (
-                    <div className="flex-1 bg-white border border-blue-100 rounded-2xl flex flex-col overflow-hidden shadow-[0_4px_24px_rgba(37,99,235,0.08)]">
-                      <div className="px-5 py-3 border-b border-blue-100 flex items-center justify-between shrink-0 bg-gradient-to-r from-blue-50 to-indigo-50">
-                        <div className="flex items-center gap-2">
-                          <Sparkles className="w-3.5 h-3.5 text-blue-500" />
-                          <span className="text-xs font-bold uppercase tracking-wider text-blue-700">Book Notes & Analysis</span>
-                        </div>
-                        <button onClick={handleCopy} className="flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-blue-700 bg-white border border-slate-200 hover:border-blue-300 px-2.5 py-1 rounded-lg transition-all shadow-sm">
-                          {copied ? <CheckCircle className="w-3 h-3 text-green-600" /> : <Copy className="w-3 h-3" />}
-                          {copied ? 'Copied!' : 'Copy'}
-                        </button>
-                      </div>
-                      <div className="flex-1 overflow-y-auto p-5">
-                        <div className="prose prose-sm max-w-none prose-headings:text-slate-800 prose-headings:font-bold prose-a:text-blue-600 prose-strong:text-slate-800">
-                          <Markdown
-                            components={{
-                              p: ({node, ...props}) => <p>{highlightChildren(props.children, searchQuery)}</p>,
-                              li: ({node, ...props}) => <li>{highlightChildren(props.children, searchQuery)}</li>,
-                              h1: ({node, ...props}) => <h1>{highlightChildren(props.children, searchQuery)}</h1>,
-                              h2: ({node, ...props}) => <h2>{highlightChildren(props.children, searchQuery)}</h2>,
-                              h3: ({node, ...props}) => <h3>{highlightChildren(props.children, searchQuery)}</h3>,
-                              strong: ({node, ...props}) => <strong>{highlightChildren(props.children, searchQuery)}</strong>,
-                            }}
-                          >
-                            {currentBreakdown}
-                          </Markdown>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </section>
+              )}
             </>
-          ) : (
-            // ── Landing / Empty State ────────────────────────────────
-            <div className="flex-1 overflow-y-auto bg-gradient-to-br from-slate-50 to-blue-50/30">
-              <div className="max-w-5xl mx-auto px-6 py-16 flex flex-col items-center">
-                <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-100 text-blue-700 font-bold text-xs mb-8 border border-blue-200 shadow-sm uppercase tracking-wider">
-                  <Zap className="w-3.5 h-3.5" /> Book Research Assistant
-                </div>
-                <h1 className="text-4xl md:text-5xl font-extrabold text-slate-900 tracking-tight text-center mb-5 leading-tight">
-                  Transform YouTube Videos into<br />
-                  <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-600">Actionable Book Notes</span>
-                </h1>
-                <p className="text-lg text-slate-500 text-center max-w-2xl mb-14 leading-relaxed">
-                  Extract transcripts from multiple YouTube videos, identify speakers, and let Gemini AI generate structured research material — all in one place.
-                </p>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-5 w-full max-w-3xl">
-                  {[
-                    { icon: Layers, color: 'blue', title: 'Bulk URL Processing', desc: 'Paste multiple YouTube URLs and analyze them all at once.' },
-                    { icon: Sparkles, color: 'indigo', title: 'AI-Powered Notes', desc: 'Gemini identifies speakers and generates structured research breakdowns.' },
-                    { icon: MessageSquare, color: 'violet', title: 'AI Chat Assistant', desc: 'Chat with AI about any video — clarify errors, extract quotes, ask questions.' },
-                    { icon: Save, color: 'emerald', title: 'Auto-Save & Export', desc: 'Everything saves automatically. Export all notes to Markdown anytime.' },
-                    { icon: Users, color: 'amber', title: 'Speaker Learning', desc: 'AI learns speaker voices across videos and builds persistent profiles.' },
-                    { icon: Calendar, color: 'rose', title: 'Quick Date Entry', desc: 'Set event dates with one click — today, last week, custom month/year.' },
-                  ].map(({ icon: Icon, color, title, desc }) => (
-                    <div key={title} className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm flex items-start gap-4 hover:shadow-md transition-shadow group">
-                      <div className={`w-10 h-10 bg-${color}-50 rounded-xl flex items-center justify-center shrink-0 border border-${color}-100 group-hover:scale-105 transition-transform`}>
-                        <Icon className={`w-5 h-5 text-${color}-600`} />
-                      </div>
-                      <div>
-                        <h3 className="font-bold text-slate-900 text-sm mb-1">{title}</h3>
-                        <p className="text-xs text-slate-500 leading-relaxed">{desc}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
           )}
+
+          {/* ── TIMELINE TAB ─────────────────────────────────────── */}
+          {activeTab === 'timeline' && (
+            <TimelineView videos={videos} metaFields={metaFields} bookBreakdowns={bookBreakdowns}
+              onSelectVideo={i => { setActiveVideoIndex(i); setActiveTab('research'); }} />
+          )}
+
+          {/* ── CROSS-SEARCH TAB ─────────────────────────────────── */}
+          {activeTab === 'search' && (
+            <CrossSearch videos={videos} metaFields={metaFields} bookBreakdowns={bookBreakdowns}
+              onSelectVideo={i => { setActiveVideoIndex(i); setActiveTab('research'); }} />
+          )}
+
+          {/* ── CONTRADICTIONS TAB ───────────────────────────────── */}
+          {activeTab === 'contradictions' && (
+            <ContradictionDetector videos={videos} metaFields={metaFields} bookBreakdowns={bookBreakdowns} />
+          )}
+
+          {/* ── QUOTES TAB ───────────────────────────────────────── */}
+          {activeTab === 'quotes' && (
+            <QuoteExtractor videos={videos} metaFields={metaFields} speakerProfiles={speakerProfiles} />
+          )}
+
         </div>
 
-        {/* ── Chat Panel ──────────────────────────────────────────────── */}
-        <ChatPanel
-          open={chatOpen}
-          onClose={() => setChatOpen(false)}
-          activeVideo={activeVideo}
-          currentBreakdown={currentBreakdown}
-          speakerProfiles={speakerProfiles}
-        />
+        {/* ── Chat Panel ──────────────────────────────────────────── */}
+        <ChatPanel open={chatOpen} onClose={() => setChatOpen(false)}
+          activeVideo={activeVideo} currentBreakdown={currentBreakdown}
+          speakerProfiles={speakerProfiles} />
       </div>
     </div>
   );
