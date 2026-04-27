@@ -1,0 +1,6 @@
+{
+  "name": "YouTube Analyzer",
+  "description": "Fetch YouTube metadata and transcripts instantly using Supadata, and polish transcripts with Gemini.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
