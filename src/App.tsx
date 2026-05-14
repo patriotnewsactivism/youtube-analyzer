@@ -12,7 +12,8 @@ import Markdown from 'react-markdown';
 import type { Video, VideoMeta, SpeakerProfile, ChatMessage } from './lib/types';
 import {
   getYoutubeId, wordCount, readTime, defaultMeta,
-  migrateLegacyProfiles, profileToPromptString, CONFIDENCE_STYLES
+  migrateLegacyProfiles, profileToPromptString, CONFIDENCE_STYLES,
+  mergeProfile, exportProfilesToJSON, importProfilesFromJSON
 } from './lib/utils';
 import QuickDatePicker from './components/QuickDatePicker';
 import SpeakerCard from './components/SpeakerCard';
@@ -40,8 +41,8 @@ const highlightChildren = (children: React.ReactNode, query: string): React.Reac
   return React.Children.map(children, child => {
     if (typeof child === 'string') return highlightText(child, query);
     if (React.isValidElement(child)) {
-      return React.cloneElement(child as React.ReactElement, (child as React.ReactElement).props,
-        highlightChildren((child as React.ReactElement).props.children, query));
+      const el = child as React.ReactElement<{ children?: React.ReactNode }>;
+      return React.cloneElement(el, el.props, highlightChildren(el.props.children, query));
     }
     return child;
   });
@@ -170,16 +171,26 @@ URL: ${activeVideo.url}
 === KNOWN SPEAKER DATABASE ===
 ${knownSpeakersText}
 
-=== SPEAKER IDENTIFICATION STEPS ===
-STEP 1 — PRE-MATCH: Based on title, date, participants hint, and known topics/roles — which known speakers are likely present?
-STEP 2 — ANALYZE: Read the transcript. Match segments to known speakers via name mentions, role references, topic expertise, speech patterns, aliases.
-STEP 3 — UNKNOWNS: For unmatched speakers, create descriptive names ("Unknown Male Host", "Female Questioner") until identified.
-STEP 4 — CONFIDENCE: Mark each as (confirmed) if named explicitly, or (inferred) if matched by context.
+=== SPEAKER IDENTIFICATION RULES ===
+CRITICAL: You have a Known Speaker Database above. USE IT AGGRESSIVELY.
+
+STEP 1 — PRE-MATCH FIRST: Before reading the transcript, list every known speaker who is LIKELY in this video based on: title keywords, date, participant hints, topics they're known to discuss, their roles. Be liberal — if there's any chance they appear, list them.
+
+STEP 2 — ANCHOR then DIARIZE: Find the first clear name mention or role reference for each speaker. Use that as your anchor. Then attribute all surrounding speech to the same speaker unless there's an explicit handoff. Never reset to "Unknown" mid-paragraph.
+
+STEP 3 — ALIAS MATCHING: If the transcript says "John", "Mr. Smith", "the congressman", "the host" — cross-reference these against ALL known aliases, roles, and topic expertise. A known speaker with 3+ appearances should almost always be identified.
+
+STEP 4 — ONLY TRUE UNKNOWNS: Only create a new "Unknown [descriptor]" speaker if they genuinely don't match any known profile. Assign a rich descriptor ("Unknown Female Journalist", "Unidentified Caller") and note distinguishing speech patterns.
+
+STEP 5 — CONFIDENCE: 
+  - "verified" = explicitly named + matches known profile
+  - "confirmed" = strongly matches patterns/role/context 
+  - "learning" = plausible match but uncertain
 
 === OUTPUT FORMAT (Markdown) ===
 
 ## Speaker Identification
-Who was identified, how, and confidence.
+For each speaker: who they are, HOW you identified them (exact quote or reasoning), confidence level.
 
 ## Summary
 Concise summary.
@@ -191,26 +202,26 @@ Bullet points: topics, people mentioned, locations, facts, key dates.
 Per speaker: what they said, their position/contribution.
 
 ## Diarized & Polished Transcript
-Full cleaned transcript. Every paragraph: **Speaker Name (confirmed/inferred):** 
-Fix transcription errors. Preserve meaning.
+Full cleaned transcript. Every paragraph: **Speaker Name (verified/confirmed/inferred):** 
+Fix transcription errors. Preserve meaning. Never leave a paragraph without a speaker label.
 
 === AFTER MARKDOWN — OUTPUT JSON ===
 \`\`\`json
 {
   "profiles": [
     {
-      "fullName": "string",
-      "aliases": ["array"],
+      "fullName": "string — use the CANONICAL name from Known Speaker Database if matched, else a descriptive name",
+      "aliases": ["any name variants seen in THIS transcript"],
       "role": "string",
-      "topics": ["array"],
-      "speechPatterns": "string",
+      "topics": ["specific topics discussed in this transcript"],
+      "speechPatterns": "distinctive vocabulary, phrases, cadence observed in this transcript",
       "confidence": "learning|confirmed|verified",
-      "notes": "string"
+      "notes": "how you identified them in this specific video"
     }
   ]
 }
 \`\`\`
-Include ALL speakers. Merge with existing — do not lose prior data.
+IMPORTANT: Include ALL speakers. If you matched to a known profile, use that profile's exact fullName. Do NOT create a new entry for someone already in the database.
 
 === TRANSCRIPT ===
 ${activeVideo.transcript}`;
@@ -225,22 +236,10 @@ ${activeVideo.transcript}`;
           const parsed = JSON.parse(jsonMatch[1]);
           const profilesArray: any[] = parsed.profiles || (Array.isArray(parsed) ? parsed : []);
           setSpeakerProfiles(prev => {
-            const updated = { ...prev };
+            let updated = { ...prev };
             for (const p of profilesArray) {
-              const name = p.fullName || p.name || 'Unknown';
-              const ex = updated[name];
-              updated[name] = {
-                fullName: name,
-                aliases: [...new Set([...(ex?.aliases || []), ...(p.aliases || [])])],
-                role: p.role || ex?.role || '',
-                topics: [...new Set([...(ex?.topics || []), ...(p.topics || [])])],
-                speechPatterns: p.speechPatterns || ex?.speechPatterns || '',
-                firstSeen: ex?.firstSeen || today,
-                lastSeen: today,
-                appearances: (ex?.appearances || 0) + 1,
-                confidence: p.confidence || ex?.confidence || 'learning',
-                notes: [ex?.notes, p.notes].filter(Boolean).join(' | ') || '',
-              };
+              // Uses fuzzy matching + auto-confidence progression
+              updated = mergeProfile(updated, p, today);
             }
             return updated;
           });
@@ -317,7 +316,13 @@ ${activeVideo.transcript}`;
       const u = { ...prev };
       const ex = u[oldName] || {} as SpeakerProfile;
       if (oldName !== newName) delete u[oldName];
-      u[newName] = { ...ex, ...updated, fullName: newName };
+      const merged = { ...ex, ...updated, fullName: newName };
+      // Auto-compute confidence from appearances unless user manually set to verified
+      if (merged.confidence !== 'verified') {
+        const apps = merged.appearances || 1;
+        merged.confidence = apps >= 10 ? 'verified' : apps >= 3 ? 'confirmed' : 'learning';
+      }
+      u[newName] = merged;
       return u;
     });
   };
@@ -436,10 +441,30 @@ ${activeVideo.transcript}`;
                 </span>
               )}
             </p>
-            <button onClick={() => setAddingSpeaker(a => !a)}
-              className="p-1 hover:bg-blue-50 rounded-lg text-slate-400 hover:text-blue-600 transition-colors" title="Add speaker">
-              <Plus className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-0.5">
+              {Object.keys(speakerProfiles).length > 0 && (
+                <button onClick={() => exportProfilesToJSON(speakerProfiles)}
+                  className="p-1 hover:bg-emerald-50 rounded-lg text-slate-400 hover:text-emerald-600 transition-colors" title="Export profiles as JSON backup">
+                  <Download className="w-3 h-3" />
+                </button>
+              )}
+              <label className="p-1 hover:bg-violet-50 rounded-lg text-slate-400 hover:text-violet-600 transition-colors cursor-pointer" title="Import profiles from JSON">
+                <AlignLeft className="w-3 h-3" />
+                <input type="file" accept=".json" className="hidden" onChange={e => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  importProfilesFromJSON(file,
+                    imported => setSpeakerProfiles(prev => ({ ...prev, ...imported })),
+                    msg => alert(msg)
+                  );
+                  e.target.value = '';
+                }} />
+              </label>
+              <button onClick={() => setAddingSpeaker(a => !a)}
+                className="p-1 hover:bg-blue-50 rounded-lg text-slate-400 hover:text-blue-600 transition-colors" title="Add speaker manually">
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
 
           {addingSpeaker && (

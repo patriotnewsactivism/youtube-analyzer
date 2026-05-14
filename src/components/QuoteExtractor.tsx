@@ -40,7 +40,7 @@ export default function QuoteExtractor({
       const allQuotes: ExtractedQuote[] = [];
 
       for (const video of targetVideos) {
-        const meta = metaFields[video.url] || {};
+        const meta = metaFields[video.url] || {} as VideoMeta;
         const prompt = `You are a research assistant extracting notable quotes for a book author.
 
 Video: "${video.title}"
